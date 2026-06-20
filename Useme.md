@@ -11,7 +11,7 @@ G1_INSPIRE_DATASETS.md
 Nhánh hiện tại:
 
 ```bash
-son-deploy-pickupdrink-inspire
+son-deploy-WBT
 ```
 
 ## 0. Chuẩn Bị Chung
@@ -54,7 +54,203 @@ right = 192.168.123.211
 
 Giữ sẵn nút dừng khẩn cấp khi dùng `--send-actions`.
 
-## 1. Task Pick Up Drinks Với G1 + Inspire Hand
+## 1. Full-Body WBT Raw Replay
+
+Nhánh `son-deploy-WBT` dùng để thử replay raw WBT dataset đủ khớp, không phải bản `flat26`.
+
+Doc chi tiết:
+
+```text
+unitree_lerobot/eval_robot/WBT_FULL_BODY_REPLAY.md
+```
+
+Script chính:
+
+```text
+unitree_lerobot/eval_robot/wbt_full_body_replay.py
+```
+
+Raw dataset mặc định:
+
+```text
+/home/jkl0909/.cache/huggingface/lerobot/unitreerobotics/G1_WBT_Inspire_Pick_Up_Drinks_raw3tmp
+```
+
+Format action raw:
+
+```text
+action.robot_q_desired[0:7]   -> root/base pose, chỉ log, không replay trực tiếp
+action.robot_q_desired[7:36]  -> 29 motor joints của G1
+action.hand_cmd[0:12]         -> 6 left Inspire + 6 right Inspire
+```
+
+Khác với pickup drink `flat26` đang chạy qua `rt/arm_sdk`, full-body raw replay publish vào:
+
+```text
+rt/lowcmd
+rt/lowstate
+```
+
+Đây là low-level full-body control, nguy hiểm hơn arm-only. Chỉ chạy thật khi robot được treo/đỡ an toàn hoặc có người giữ emergency stop.
+
+### 1.1. Bật bridge 2 tay Inspire
+
+Terminal 1, tay trái:
+
+```bash
+cd /home/jkl0909/code/Son/unitree_lerobot
+conda activate unitree_lerobot
+
+python unitree_lerobot/eval_robot/inspire_hand_ftp_driver.py \
+  --network-interface=enp1s0 \
+  --hand=left \
+  --ip=192.168.123.210 \
+  --frequency=20 \
+  --no-touch
+```
+
+Terminal 2, tay phải:
+
+```bash
+cd /home/jkl0909/code/Son/unitree_lerobot
+conda activate unitree_lerobot
+
+python unitree_lerobot/eval_robot/inspire_hand_ftp_driver.py \
+  --network-interface=enp1s0 \
+  --hand=right \
+  --ip=192.168.123.211 \
+  --frequency=20 \
+  --no-touch
+```
+
+### 1.2. Test tay trước
+
+Read-only:
+
+```bash
+python unitree_lerobot/eval_robot/test_inspire_hand_command.py \
+  --network-interface=enp1s0 \
+  --hand=right
+```
+
+Đóng/mở tay phải:
+
+```bash
+python unitree_lerobot/eval_robot/test_inspire_hand_command.py \
+  --network-interface=enp1s0 \
+  --hand=right \
+  --preset=close \
+  --force=500 \
+  --speed=300 \
+  --send-command \
+  --control-confirmation=SEND_TEST_INSPIRE_HAND
+
+python unitree_lerobot/eval_robot/test_inspire_hand_command.py \
+  --network-interface=enp1s0 \
+  --hand=right \
+  --preset=open \
+  --force=500 \
+  --speed=300 \
+  --send-command \
+  --control-confirmation=SEND_TEST_INSPIRE_HAND
+```
+
+Nếu tay trái vẫn báo `status=7` hoặc ngón út kẹt, khi test full-body có thể tạm thêm:
+
+```text
+--ignore-inspire-status
+--disable-left-hand
+```
+
+### 1.3. Preview raw dataset
+
+Chỉ đọc dataset và in range từng khớp, không gửi lệnh robot:
+
+```bash
+cd /home/jkl0909/code/Son/unitree_lerobot
+conda activate unitree_lerobot
+
+python unitree_lerobot/eval_robot/wbt_full_body_replay.py \
+  --preview-only \
+  --episode=0 \
+  --episode-count=3 \
+  --max-steps=10
+```
+
+### 1.4. Dry run replay
+
+Chạy vòng replay và ghi CSV, nhưng không publish `rt/lowcmd` vì không có `--send-actions`:
+
+```bash
+python unitree_lerobot/eval_robot/wbt_full_body_replay.py \
+  --episode=0 \
+  --episode-count=1 \
+  --max-steps=100 \
+  --frequency=30
+```
+
+### 1.5. Real robot full-body test ngắn
+
+Chỉ chạy sau khi đã preview/dry-run và robot đang ở trạng thái an toàn:
+
+```bash
+python unitree_lerobot/eval_robot/wbt_full_body_replay.py \
+  --episode=0 \
+  --episode-count=1 \
+  --max-steps=30 \
+  --frequency=30 \
+  --network-interface=enp1s0 \
+  --initialize-from-dataset \
+  --initialization-speed-rad-s=0.05 \
+  --initialization-max-error-rad=0.10 \
+  --max-body-delta-rad=0.005 \
+  --low-body-kp-scale=0.25 \
+  --arm-kp-scale=0.8 \
+  --hand-force=300 \
+  --hand-speed=200 \
+  --max-hand-delta=50 \
+  --send-actions \
+  --control-confirmation=SEND_FULL_BODY_G1_WBT
+```
+
+Flow đúng:
+
+```text
+Loaded raw dataset...
+episode=0 dataset_index=... actions=...
+G1 MotionSwitcher: ...
+left Inspire state: ...
+right Inspire state: ...
+Initializing full body to first dataset joint pose...
+Initial body pose reached: max_error=...
+Initial pose stage done. Enter 's' to start full-body replay, anything else to stop:
+```
+
+Chỉ nhập `s` nếu robot ổn định.
+
+Nếu chỉ muốn test G1 body, không gửi tay Inspire:
+
+```bash
+python unitree_lerobot/eval_robot/wbt_full_body_replay.py \
+  --episode=0 \
+  --episode-count=1 \
+  --max-steps=30 \
+  --frequency=30 \
+  --network-interface=enp1s0 \
+  --initialize-from-dataset \
+  --initialization-speed-rad-s=0.05 \
+  --initialization-max-error-rad=0.10 \
+  --max-body-delta-rad=0.005 \
+  --low-body-kp-scale=0.25 \
+  --arm-kp-scale=0.8 \
+  --no-hands \
+  --send-actions \
+  --control-confirmation=SEND_FULL_BODY_G1_WBT
+```
+
+`--release-motion-mode` chỉ thêm khi thật sự muốn chuyển sang low-level control và đã hiểu rủi ro; không thêm máy móc như các lệnh arm-only.
+
+## 2. Task Pick Up Drinks Với G1 + Inspire Hand
 
 Dataset local:
 
@@ -90,7 +286,7 @@ Script `wbt_inspire_hybrid_infer.py` đã scale bằng:
 --hand-action-scale=1000
 ```
 
-## 2. Bật Bridge Cho Inspire Hand
+## 3. Bật Bridge Cho Inspire Hand
 
 Inspire hand không tự publish DDS state. Cần chạy bridge Modbus TCP sang DDS.
 
@@ -134,7 +330,7 @@ rt/inspire_hand/ctrl/l
 rt/inspire_hand/ctrl/r
 ```
 
-## 3. Test Inspire Hand
+## 4. Test Inspire Hand
 
 Read-only tay phải:
 
@@ -224,7 +420,7 @@ Ghi chú phần cứng hiện tại:
 - Có lúc tay trái báo `status=7`; hiểu là actuator/electric-cylinder fault stop.
 - Lệnh chuẩn hiện bật cả hai tay. Theo dõi tay trái sát; `--ignore-inspire-status` chỉ bỏ chặn phần mềm, không sửa lỗi phần cứng.
 
-## 4. Dry Run Pick Up Drinks
+## 5. Dry Run Pick Up Drinks
 
 Dry run không gửi lệnh thật vì không có `--send-actions`.
 
@@ -251,7 +447,7 @@ Kỳ vọng:
 dry_run=True
 ```
 
-## 5. Replay Dataset Action Trên Robot Thật
+## 6. Replay Dataset Action Trên Robot Thật
 
 Đây là chế độ đã dùng để kiểm tra robot làm theo dữ liệu gốc.
 Có `--use-dataset-action`, nghĩa là không dùng policy sinh action mà phát lại action trong dataset.
@@ -323,7 +519,7 @@ action_step=50  -> dataset_index=1421
 action_step=773 -> dataset_index=2144
 ```
 
-## 6. Chạy Policy Thật
+## 7. Chạy Policy Thật
 
 Nếu bỏ `--use-dataset-action`, script sẽ dùng checkpoint để sinh action từ:
 
@@ -363,7 +559,7 @@ python unitree_lerobot/eval_robot/wbt_inspire_hybrid_infer.py \
   --control-confirmation=SEND_TO_REAL_G1_INSPIRE
 ```
 
-## 7. Chạy Episode Khác
+## 8. Chạy Episode Khác
 
 Dataset `G1_WBT_Inspire_Pick_Up_Drinks_flat26` có 300 episode, index hợp lệ:
 
@@ -392,7 +588,7 @@ episode 4: dataset_index 2919 -> 3742, 824 action, ~27.47s
 
 Episode không chồng lấn. `dataset_to_index` là exclusive, nên frame cuối thật là `dataset_to_index - 1`.
 
-## 8. Chạy Nhiều Episode Liên Tiếp
+## 9. Chạy Nhiều Episode Liên Tiếp
 
 Script hỗ trợ:
 
@@ -450,7 +646,7 @@ DDS, arm controller và Inspire readers/publishers chỉ được init một l�
 Exception: channel factory init error.
 ```
 
-## 9. Các Param Quan Trọng
+## 10. Các Param Quan Trọng
 
 ```text
 --motion
@@ -552,7 +748,7 @@ min(max-policy-steps, số action còn lại của episode)
 
 Nếu episode chỉ có 716 action, đặt `--max-policy-steps=1200` vẫn chỉ chạy 716 action.
 
-## 10. Lỗi Thường Gặp
+## 11. Lỗi Thường Gặp
 
 Nếu init in:
 
@@ -602,7 +798,7 @@ Exception: channel factory init error.
 
 nghĩa là code đang cố `ChannelFactoryInitialize` nhiều lần trong cùng process. Bản hiện tại đã sửa bằng cách init DDS một lần rồi reuse cho các episode sau.
 
-## 11. Legacy: ToastedBread Với G1 + Dex3
+## 12. Legacy: ToastedBread Với G1 + Dex3
 
 Phần này là pipeline cũ của task ToastedBread/Dex3.
 
@@ -657,7 +853,7 @@ Enter 's' to start policy control, or anything else to stop while holding pose:
 
 chỉ nhập `s` nếu tư thế tay ổn định và an toàn.
 
-## 12. Test Camera G1
+## 13. Test Camera G1
 
 Repo hiện có code nền để đọc camera, nhưng pipeline `wbt_inspire_hybrid_infer.py` hiện vẫn dùng video từ dataset. Trước khi nối camera thật vào policy, test camera riêng trước.
 
