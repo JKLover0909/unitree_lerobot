@@ -19,10 +19,15 @@ import numpy as np
 def decode_jpeg_frame(data: Any) -> np.ndarray:
     import cv2
 
-    image_data = np.frombuffer(bytes(data), dtype=np.uint8)
+    raw = bytes(data)
+    if not raw:
+        raise RuntimeError("Unitree VideoClient returned an empty image buffer.")
+    image_data = np.frombuffer(raw, dtype=np.uint8)
     image = cv2.imdecode(image_data, cv2.IMREAD_COLOR)
     if image is None:
-        raise RuntimeError("Unitree VideoClient returned data, but OpenCV could not decode it as an image.")
+        raise RuntimeError(
+            f"Unitree VideoClient returned {len(raw)} bytes, but OpenCV could not decode it as an image."
+        )
     return image
 
 
@@ -55,19 +60,32 @@ def run_unitree_video(args: argparse.Namespace, output_dir: Path) -> None:
     client.Init()
 
     saved = 0
-    for idx in range(args.frames):
+    attempts = 0
+    max_attempts = max(args.frames, 1) + max(args.warmup_attempts, 0)
+    while saved < args.frames and attempts < max_attempts:
+        attempts += 1
         code, data = client.GetImageSample()
+        data_len = len(bytes(data)) if data is not None else 0
+        print(f"attempt={attempts} code={code} bytes={data_len}")
         if code != 0:
             raise RuntimeError(f"GetImageSample failed with code={code}")
+        if data_len == 0:
+            continue
 
         frame = decode_jpeg_frame(data)
-        output_path = output_dir / f"unitree_video_frame_{idx:03d}.jpg"
+        output_path = output_dir / f"unitree_video_frame_{saved:03d}.jpg"
         save_frame(frame, output_path)
+        print(f"frame={saved} shape={frame.shape} saved={output_path}")
         saved += 1
-        print(f"frame={idx} shape={frame.shape} saved={output_path}")
 
         if args.display and maybe_display(frame, "g1_head_camera_unitree_video", args.display_delay_ms):
             break
+
+    if saved == 0:
+        raise RuntimeError(
+            "No non-empty image buffer was received from Unitree VideoClient. "
+            "Check whether the robot camera/videohub service is enabled and reachable on this interface."
+        )
 
     if args.display:
         import cv2
@@ -132,6 +150,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--request-port", type=int, default=60000, help="ImageServer config request port.")
     parser.add_argument("--timeout-s", type=float, default=3.0, help="Unitree VideoClient timeout.")
     parser.add_argument("--frames", type=int, default=5, help="Number of frames to capture.")
+    parser.add_argument("--warmup-attempts", type=int, default=30, help="Extra GetImageSample attempts for empty warmup frames.")
     parser.add_argument("--output-dir", type=Path, default=Path("camera_test_results"), help="Output directory.")
     parser.add_argument("--display", action="store_true", help="Show frames with OpenCV while capturing.")
     parser.add_argument("--display-delay-ms", type=int, default=20)
