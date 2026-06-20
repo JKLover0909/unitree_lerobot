@@ -1,1 +1,0 @@
-policy_step,dataset_index,dataset_frame,inference_s,loop_s,sent_to_robot,arm_state,left_hand_state,right_hand_state,predicted_action,limited_arm,limited_left_hand,limited_right_hand,dataset_state,dataset_action
