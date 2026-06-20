@@ -32,7 +32,9 @@ import json
 import sys
 import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -46,7 +48,7 @@ from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.processor.rename_processor import rename_stats
 from lerobot.utils.utils import get_safe_torch_device, init_logging
 
-from unitree_lerobot.eval_robot.hybrid_arm_utils import ARM_DOF, limit_arm_target
+from unitree_lerobot.eval_robot.hybrid_arm_utils import ARM_DOF, chunk_timestep_range, limit_arm_target
 from unitree_lerobot.eval_robot.utils.utils import extract_observation
 
 
@@ -137,8 +139,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repo-id", default="local/G1_WBT_Inspire_Pick_Up_Drinks_flat26")
     parser.add_argument("--root", default=None)
     parser.add_argument("--episode", type=int, default=0)
+    parser.add_argument("--episode-count", type=int, default=1, help="Run this many consecutive episodes.")
     parser.add_argument("--start-frame", type=int, default=0)
     parser.add_argument("--max-policy-steps", type=int, default=120)
+    parser.add_argument(
+        "--actions-per-inference",
+        type=int,
+        default=100,
+        help="Maximum actions consumed from each ACT chunk.",
+    )
+    parser.add_argument(
+        "--prefetch-threshold",
+        type=float,
+        default=0.9,
+        help="Start background inference when the queue falls to this fraction of actions-per-inference.",
+    )
+    parser.add_argument(
+        "--synchronous-inference",
+        action="store_true",
+        help="Disable background prefetch and wait for each ACT chunk synchronously.",
+    )
     parser.add_argument("--frequency", type=float, default=30.0)
     parser.add_argument("--network-interface", default=None)
     parser.add_argument("--motion", action="store_true", help="Use rt/arm_sdk for G1 arms.")
@@ -190,8 +210,14 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--frequency must be positive")
     if args.episode < 0 or args.start_frame < 0:
         raise ValueError("--episode and --start-frame must be non-negative")
+    if args.episode_count <= 0:
+        raise ValueError("--episode-count must be positive")
     if args.max_policy_steps is not None and args.max_policy_steps <= 0:
         raise ValueError("--max-policy-steps must be positive")
+    if args.actions_per_inference <= 0:
+        raise ValueError("--actions-per-inference must be positive")
+    if not 0 < args.prefetch_threshold < 1:
+        raise ValueError("--prefetch-threshold must be between zero and one")
     if args.max_arm_delta_rad <= 0 or args.max_hand_delta <= 0:
         raise ValueError("Delta limits must be positive")
     if args.hand_state_scale <= 0 or args.hand_action_scale <= 0:
@@ -220,8 +246,8 @@ def episode_bounds(dataset: LeRobotDataset, episode: int, start_frame: int) -> t
     return start, episode_to
 
 
-def make_run_dir(output_root: Path, run_name: str | None, episode: int) -> Path:
-    if run_name is None:
+def make_run_dir(output_root: Path, run_name: str | None, episode: int, episode_count: int = 1) -> Path:
+    if run_name is None or episode_count > 1:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         run_name = f"{timestamp}_episode-{episode:03d}"
     run_dir = output_root / run_name
@@ -231,6 +257,8 @@ def make_run_dir(output_root: Path, run_name: str | None, episode: int) -> Path:
 
 def load_policy_and_processors(policy_path: Path, dataset: LeRobotDataset):
     policy_cfg = PreTrainedConfig.from_pretrained(policy_path)
+    if policy_cfg.type != "act":
+        raise ValueError(f"Async WBT inference requires an ACT checkpoint, got {policy_cfg.type!r}")
     state_feature = policy_cfg.input_features.get("observation.state")
     action_feature = policy_cfg.output_features.get("action")
     if state_feature is None or tuple(state_feature.shape) != (STATE_DOF,):
@@ -253,7 +281,7 @@ def load_policy_and_processors(policy_path: Path, dataset: LeRobotDataset):
     return policy_cfg, policy, preprocessor, postprocessor, device
 
 
-def predict_action(
+def predict_action_chunk(
     observation: dict[str, Any],
     task: str,
     policy,
@@ -275,12 +303,79 @@ def predict_action(
         else nullcontext(),
     ):
         processed = preprocessor(batch)
-        action = policy.select_action(processed)
-        action = postprocessor(action)
-    action_np = action.squeeze(0).detach().cpu().numpy()
-    if action_np.shape != (STATE_DOF,) or not np.all(np.isfinite(action_np)):
-        raise ValueError(f"Expected finite action shape ({STATE_DOF},), got {action_np.shape}")
-    return action_np
+        chunk = policy.predict_action_chunk(processed)
+        chunk = postprocessor(chunk)
+    chunk_np = chunk.squeeze(0).detach().cpu().numpy()
+    if chunk_np.ndim != 2 or chunk_np.shape[1] != STATE_DOF or not np.all(np.isfinite(chunk_np)):
+        raise ValueError(f"Expected finite action chunk shape (T, {STATE_DOF}), got {chunk_np.shape}")
+    return chunk_np
+
+
+@dataclass
+class QueuedAction:
+    predicted: np.ndarray
+    chunk_offset: int
+    inference_anchor: int
+    inference_s: float
+    report_inference: bool = False
+
+
+@dataclass
+class InferenceResult:
+    anchor: int
+    action_chunk: np.ndarray
+    inference_s: float
+
+
+def infer_action_chunk(
+    dataset,
+    anchor: int,
+    real_state: np.ndarray,
+    policy,
+    preprocessor,
+    postprocessor,
+    device: torch.device,
+) -> InferenceResult:
+    observation, task, _, _ = compose_observation(dataset, anchor, real_state)
+    preprocessor.reset()
+    postprocessor.reset()
+    inference_start = time.perf_counter()
+    chunk = predict_action_chunk(observation, task, policy, preprocessor, postprocessor, device)
+    return InferenceResult(
+        anchor=anchor,
+        action_chunk=chunk,
+        inference_s=time.perf_counter() - inference_start,
+    )
+
+
+def merge_inference_result(
+    action_queue: dict[int, QueuedAction],
+    result: InferenceResult,
+    current_timestep: int,
+    actions_per_inference: int,
+    stop_timestep: int,
+) -> int:
+    timesteps = chunk_timestep_range(
+        result.anchor,
+        len(result.action_chunk),
+        actions_per_inference,
+        current_timestep,
+    )
+    inserted_timesteps = []
+    for timestep in timesteps:
+        if timestep >= stop_timestep:
+            break
+        offset = timestep - result.anchor
+        action_queue[timestep] = QueuedAction(
+            predicted=result.action_chunk[offset],
+            chunk_offset=offset,
+            inference_anchor=result.anchor,
+            inference_s=result.inference_s,
+        )
+        inserted_timesteps.append(timestep)
+    if inserted_timesteps:
+        action_queue[min(inserted_timesteps)].report_inference = True
+    return len(inserted_timesteps)
 
 
 def tensor_to_numpy(value: Any) -> np.ndarray:
@@ -491,10 +586,11 @@ def initialize_from_dataset_pose(
     raise TimeoutError("Timed out while initializing to dataset pose")
 
 
-def write_config(run_dir: Path, args: argparse.Namespace, policy_cfg, start: int, stop: int) -> None:
+def write_config(run_dir: Path, args: argparse.Namespace, policy_cfg, start: int, stop: int, episode: int) -> None:
     config = vars(args).copy()
     config.update(
         {
+            "effective_episode": episode,
             "policy_path": str(Path(args.policy_path).resolve()),
             "dataset_start_index": start,
             "dataset_stop_index": stop,
@@ -507,22 +603,61 @@ def write_config(run_dir: Path, args: argparse.Namespace, policy_cfg, start: int
     (run_dir / "config.json").write_text(json.dumps(config, indent=2) + "\n")
 
 
-def run(args: argparse.Namespace) -> Path:
-    validate_args(args)
-    dataset = LeRobotDataset(repo_id=args.repo_id, root=args.root)
-    start, stop = episode_bounds(dataset, args.episode, args.start_frame)
+def confirm_start() -> bool:
+    while True:
+        try:
+            response = input("Initial pose reached. Enter 's' to start, or 'q' to stop: ")
+        except EOFError:
+            print("No interactive input received. Holding pose and stopping.")
+            return False
+        response = response.strip().lower()
+        if response == "s":
+            return True
+        if response in {"q", "n", "no", "stop"}:
+            return False
+        if response == "":
+            print("Empty input ignored. Type 's' to start or 'q' to stop.")
+            continue
+        print("Unknown input. Type 's' to start or 'q' to stop.")
+
+
+def run_episode(
+    args: argparse.Namespace,
+    dataset: LeRobotDataset,
+    policy_cfg,
+    policy,
+    preprocessor,
+    postprocessor,
+    device: torch.device,
+    arm_source,
+    arm_ik,
+    left_reader,
+    right_reader,
+    left_pub,
+    right_pub,
+    episode: int,
+    episode_offset: int,
+) -> tuple[Path, bool]:
+    start_frame = args.start_frame if episode_offset == 0 else 0
+    start, episode_stop = episode_bounds(dataset, episode, start_frame)
+    stop = episode_stop
     if args.max_policy_steps is not None:
         stop = min(stop, start + args.max_policy_steps)
-    policy_cfg, policy, preprocessor, postprocessor, device = load_policy_and_processors(Path(args.policy_path), dataset)
+    total_steps = stop - start
+    episode_remaining_steps = episode_stop - start
 
-    run_dir = make_run_dir(Path(args.output_root), args.run_name, args.episode)
-    write_config(run_dir, args, policy_cfg, start, stop)
+    run_dir = make_run_dir(Path(args.output_root), args.run_name, episode, args.episode_count)
+    write_config(run_dir, args, policy_cfg, start, stop, episode)
     csv_path = run_dir / "steps.csv"
     fieldnames = [
         "policy_step",
         "dataset_index",
         "dataset_frame",
+        "chunk_offset",
+        "inference_anchor",
         "inference_s",
+        "action_queue_size",
+        "queue_wait_s",
         "action_source",
         "loop_s",
         "sent_to_robot",
@@ -537,10 +672,20 @@ def run(args: argparse.Namespace) -> Path:
         "dataset_action",
     ]
 
-    arm_source = arm_ik = left_reader = right_reader = left_pub = right_pub = None
-    try:
-        arm_source, arm_ik, left_reader, right_reader, left_pub, right_pub = setup_dds_and_io(args)
+    def read_current_state() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        arm_state = read_arm_state(arm_source, args.state_timeout_s)
+        left_state = read_hand_state(left_reader, args.state_timeout_s, "left", args.ignore_inspire_status)
+        right_state = read_hand_state(right_reader, args.state_timeout_s, "right", args.ignore_inspire_status)
+        real_state = np.concatenate(
+            [
+                arm_state,
+                left_state / args.hand_state_scale,
+                right_state / args.hand_state_scale,
+            ]
+        ).astype(np.float32)
+        return arm_state, left_state, right_state, real_state
 
+    try:
         print(f"Loading initial dataset state at index {start} without video decode...", flush=True)
         first_step = get_dataset_row_no_video(dataset, start)
         first_state = tensor_to_numpy(first_step["observation.state"])
@@ -557,43 +702,35 @@ def run(args: argparse.Namespace) -> Path:
                 right_pub,
                 first_state,
             )
-            confirmation = input("Initial pose reached. Enter 's' to start policy, anything else to stop: ")
-            if confirmation.strip().lower() != "s":
-                return run_dir
+            if not confirm_start():
+                return run_dir, False
+
+        action_source = "dataset" if args.use_dataset_action else "policy"
+        max_steps_text = "episode end" if args.max_policy_steps is None else str(args.max_policy_steps)
+        print(
+            f"Starting {action_source} action playback: episode={episode} "
+            f"dataset_index={start}..{stop - 1} actions={total_steps} "
+            f"(episode_remaining={episode_remaining_steps}, max_policy_steps={max_steps_text})",
+            flush=True,
+        )
 
         with csv_path.open("w", newline="") as csv_file:
             writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
             writer.writeheader()
-            for dataset_index in range(start, stop):
-                loop_start = time.perf_counter()
-                arm_state = read_arm_state(arm_source, args.state_timeout_s)
-                left_state = read_hand_state(left_reader, args.state_timeout_s, "left", args.ignore_inspire_status)
-                right_state = read_hand_state(right_reader, args.state_timeout_s, "right", args.ignore_inspire_status)
-                real_state = np.concatenate(
-                    [
-                        arm_state,
-                        left_state / args.hand_state_scale,
-                        right_state / args.hand_state_scale,
-                    ]
-                ).astype(np.float32)
-
-                if args.use_dataset_action:
-                    step = get_dataset_row_no_video(dataset, dataset_index)
-                    dataset_state = tensor_to_numpy(step["observation.state"])
-                    dataset_action = tensor_to_numpy(step["action"])
-                    action = dataset_action.astype(np.float32)
-                    if action.shape != (STATE_DOF,) or not np.all(np.isfinite(action)):
-                        raise ValueError(f"Expected dataset action shape ({STATE_DOF},), got {action.shape}")
-                    inference_s = 0.0
-                else:
-                    observation, task, dataset_state, step = compose_observation(dataset, dataset_index, real_state)
-                    dataset_action = tensor_to_numpy(step["action"])
-                    preprocessor.reset()
-                    postprocessor.reset()
-                    inference_start = time.perf_counter()
-                    action = predict_action(observation, task, policy, preprocessor, postprocessor, device)
-                    inference_s = time.perf_counter() - inference_start
-
+            def execute_action(
+                dataset_index: int,
+                step: dict[str, Any],
+                dataset_state: np.ndarray,
+                dataset_action: np.ndarray,
+                action: np.ndarray,
+                inference_s: float,
+                chunk_offset: int,
+                inference_anchor: int,
+                action_queue_size: int,
+                queue_wait_s: float,
+                loop_start: float,
+            ) -> None:
+                arm_state, left_state, right_state, _ = read_current_state()
                 pred_arm = action[:ARM_DOF]
                 pred_left = action[ARM_DOF : ARM_DOF + HAND_DOF] * args.hand_action_scale
                 pred_right = action[ARM_DOF + HAND_DOF :] * args.hand_action_scale
@@ -614,7 +751,11 @@ def run(args: argparse.Namespace) -> Path:
                         "policy_step": dataset_index - start,
                         "dataset_index": dataset_index,
                         "dataset_frame": tensor_item_int(step["frame_index"]),
+                        "chunk_offset": chunk_offset,
+                        "inference_anchor": inference_anchor,
                         "inference_s": inference_s,
+                        "action_queue_size": action_queue_size,
+                        "queue_wait_s": queue_wait_s,
                         "action_source": "dataset" if args.use_dataset_action else "policy",
                         "loop_s": time.perf_counter() - loop_start,
                         "sent_to_robot": args.send_actions,
@@ -631,16 +772,152 @@ def run(args: argparse.Namespace) -> Path:
                 )
                 csv_file.flush()
 
-                policy_step = dataset_index - start + 1
-                if policy_step % 10 == 0 or dataset_index + 1 == stop:
-                    print(
-                        f"step={policy_step} inference={inference_s * 1000:.1f}ms "
-                        f"source={'dataset' if args.use_dataset_action else 'policy'} "
-                        f"dry_run={not args.send_actions}"
+            if args.use_dataset_action:
+                for dataset_index in range(start, stop):
+                    loop_start = time.perf_counter()
+                    step = get_dataset_row_no_video(dataset, dataset_index)
+                    dataset_state = tensor_to_numpy(step["observation.state"])
+                    dataset_action = tensor_to_numpy(step["action"])
+                    action = dataset_action.astype(np.float32)
+                    if action.shape != (STATE_DOF,) or not np.all(np.isfinite(action)):
+                        raise ValueError(f"Expected dataset action shape ({STATE_DOF},), got {action.shape}")
+                    execute_action(
+                        dataset_index,
+                        step,
+                        dataset_state,
+                        dataset_action,
+                        action,
+                        inference_s=0.0,
+                        chunk_offset=-1,
+                        inference_anchor=-1,
+                        action_queue_size=0,
+                        queue_wait_s=0.0,
+                        loop_start=loop_start,
                     )
+                    policy_step = dataset_index - start + 1
+                    if policy_step % 50 == 0 or dataset_index + 1 == stop:
+                        print(
+                            f"action_step={policy_step}/{total_steps} dataset_index={dataset_index} "
+                            f"source=dataset dry_run={not args.send_actions}",
+                            flush=True,
+                        )
+                    elapsed = time.perf_counter() - loop_start
+                    time.sleep(max(0.0, 1.0 / args.frequency - elapsed))
+            else:
+                prefetch_count = max(1, int(np.ceil(args.actions_per_inference * args.prefetch_threshold)))
+                action_queue: dict[int, QueuedAction] = {}
+                inference_future: Future[InferenceResult] | None = None
 
-                elapsed = time.perf_counter() - loop_start
-                time.sleep(max(0.0, 1.0 / args.frequency - elapsed))
+                with ThreadPoolExecutor(max_workers=1, thread_name_prefix="wbt-act-inference") as executor:
+
+                    def submit_inference(anchor: int) -> Future[InferenceResult]:
+                        _, _, _, real_state = read_current_state()
+                        return executor.submit(
+                            infer_action_chunk,
+                            dataset,
+                            anchor,
+                            real_state,
+                            policy,
+                            preprocessor,
+                            postprocessor,
+                            device,
+                        )
+
+                    inference_future = submit_inference(start)
+                    print("Preparing initial ACT action chunk...", flush=True)
+
+                    for dataset_index in range(start, stop):
+                        loop_start = time.perf_counter()
+                        queue_wait_s = 0.0
+
+                        if inference_future is not None and inference_future.done():
+                            result = inference_future.result()
+                            inserted = merge_inference_result(
+                                action_queue,
+                                result,
+                                dataset_index,
+                                args.actions_per_inference,
+                                stop,
+                            )
+                            print(
+                                f"inference anchor={result.anchor - start} "
+                                f"time={result.inference_s * 1000:.1f}ms "
+                                f"usable_actions={inserted} queue={len(action_queue)}",
+                                flush=True,
+                            )
+                            inference_future = None
+
+                        for stale_timestep in [t for t in action_queue if t < dataset_index]:
+                            del action_queue[stale_timestep]
+
+                        if dataset_index not in action_queue:
+                            if inference_future is None:
+                                inference_future = submit_inference(dataset_index)
+                            wait_start = time.perf_counter()
+                            result = inference_future.result()
+                            queue_wait_s = time.perf_counter() - wait_start
+                            inserted = merge_inference_result(
+                                action_queue,
+                                result,
+                                dataset_index,
+                                args.actions_per_inference,
+                                stop,
+                            )
+                            print(
+                                f"inference anchor={result.anchor - start} "
+                                f"time={result.inference_s * 1000:.1f}ms "
+                                f"usable_actions={inserted} queue={len(action_queue)} "
+                                f"wait={queue_wait_s * 1000:.1f}ms",
+                                flush=True,
+                            )
+                            inference_future = None
+                            if dataset_index not in action_queue:
+                                raise RuntimeError("Inference completed without an action for the current timestep")
+
+                        queued_action = action_queue.pop(dataset_index)
+                        step = get_dataset_row_no_video(dataset, dataset_index)
+                        dataset_state = tensor_to_numpy(step["observation.state"])
+                        dataset_action = tensor_to_numpy(step["action"])
+                        inference_s = queued_action.inference_s if queued_action.report_inference else 0.0
+                        execute_action(
+                            dataset_index,
+                            step,
+                            dataset_state,
+                            dataset_action,
+                            queued_action.predicted,
+                            inference_s=inference_s,
+                            chunk_offset=queued_action.chunk_offset,
+                            inference_anchor=queued_action.inference_anchor - start,
+                            action_queue_size=len(action_queue),
+                            queue_wait_s=queue_wait_s,
+                            loop_start=loop_start,
+                        )
+
+                        next_timestep = dataset_index + 1
+                        remaining_actions = sum(t >= next_timestep for t in action_queue)
+                        remaining_episode = stop - next_timestep
+                        should_prefetch = (
+                            not args.synchronous_inference and remaining_actions <= prefetch_count
+                        ) or (args.synchronous_inference and remaining_actions == 0)
+                        if (
+                            should_prefetch
+                            and remaining_actions < remaining_episode
+                            and inference_future is None
+                            and next_timestep < stop
+                        ):
+                            inference_future = submit_inference(next_timestep)
+
+                        policy_step = dataset_index - start + 1
+                        if policy_step % 50 == 0 or next_timestep == stop:
+                            print(
+                                f"action_step={policy_step}/{total_steps} dataset_index={dataset_index} "
+                                f"queue={remaining_actions} prefetch={inference_future is not None} "
+                                f"wait={queue_wait_s * 1000:.1f}ms dry_run={not args.send_actions}",
+                                flush=True,
+                            )
+
+                        elapsed = time.perf_counter() - loop_start
+                        time.sleep(max(0.0, 1.0 / args.frequency - elapsed))
     finally:
         if args.send_actions and arm_source is not None and arm_ik is not None:
             try:
@@ -649,7 +926,57 @@ def run(args: argparse.Namespace) -> Path:
             except Exception as exc:
                 print(f"WARNING: failed to hold final arm state: {exc}")
 
-    return run_dir
+    return run_dir, True
+
+
+def run(args: argparse.Namespace) -> Path:
+    validate_args(args)
+    dataset = LeRobotDataset(repo_id=args.repo_id, root=args.root)
+    last_episode = args.episode + args.episode_count - 1
+    if last_episode >= dataset.meta.total_episodes:
+        raise ValueError(f"Episode range {args.episode}..{last_episode} is out of range [0, {dataset.meta.total_episodes - 1}]")
+    policy_cfg, policy, preprocessor, postprocessor, device = load_policy_and_processors(Path(args.policy_path), dataset)
+    if not args.use_dataset_action and policy_cfg.chunk_size < args.actions_per_inference:
+        raise ValueError(
+            f"--actions-per-inference={args.actions_per_inference} exceeds ACT chunk_size={policy_cfg.chunk_size}"
+        )
+
+    arm_source = arm_ik = left_reader = right_reader = left_pub = right_pub = None
+    try:
+        arm_source, arm_ik, left_reader, right_reader, left_pub, right_pub = setup_dds_and_io(args)
+        last_run_dir = None
+        for offset, episode in enumerate(range(args.episode, args.episode + args.episode_count)):
+            if args.episode_count > 1:
+                print(f"===== Episode {episode} ({offset + 1}/{args.episode_count}) =====", flush=True)
+            last_run_dir, completed = run_episode(
+                args=args,
+                dataset=dataset,
+                policy_cfg=policy_cfg,
+                policy=policy,
+                preprocessor=preprocessor,
+                postprocessor=postprocessor,
+                device=device,
+                arm_source=arm_source,
+                arm_ik=arm_ik,
+                left_reader=left_reader,
+                right_reader=right_reader,
+                left_pub=left_pub,
+                right_pub=right_pub,
+                episode=episode,
+                episode_offset=offset,
+            )
+            if not completed:
+                print(f"Stopped before episode {episode} playback.", flush=True)
+                break
+    finally:
+        if args.send_actions and arm_source is not None and arm_ik is not None:
+            try:
+                hold_arm = read_arm_state(arm_source, args.state_timeout_s)
+                arm_source.ctrl_dual_arm(hold_arm, arm_ik.solve_tau(hold_arm))
+            except Exception as exc:
+                print(f"WARNING: failed to hold final arm state: {exc}")
+    assert last_run_dir is not None
+    return last_run_dir
 
 
 def main() -> None:

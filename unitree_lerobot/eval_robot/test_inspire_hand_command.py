@@ -27,8 +27,8 @@ CONTROL_CONFIRMATION = "SEND_TEST_INSPIRE_HAND"
 JOINT_NAMES = ["pinky", "ring", "middle", "index", "thumb_bend", "thumb_rotation"]
 DOF = 6
 PRESETS = {
-    "close": [800, 800, 800, 800, 500, 0],
-    "open": [0, 0, 0, 0, 0, 1000],
+    "open": [800, 800, 800, 800, 500, 0],
+    "close": [0, 0, 0, 0, 0, 1000],
 }
 
 
