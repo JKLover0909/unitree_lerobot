@@ -368,6 +368,73 @@ dimensions. The default mode is read-only dry-run.
 See [`unitree_lerobot/eval_robot/HYBRID_ARM_INFERENCE.md`](unitree_lerobot/eval_robot/HYBRID_ARM_INFERENCE.md)
 for the data flow, safety constraints, and commands.
 
+## 5.2 WBT Full-Body Replay (G1 + Inspire)
+
+Replay raw WBT dataset actions across all 29 G1 body joints + Inspire hands via `rt/lowcmd`.
+This is more dangerous than arm-only control. Only run when the robot is safely supported
+or someone is holding the emergency stop.
+
+See [`unitree_lerobot/eval_robot/WBT_FULL_BODY_REPLAY.md`](unitree_lerobot/eval_robot/WBT_FULL_BODY_REPLAY.md)
+for full documentation.
+
+### Initialization flags (added 2026-06-26)
+
+Two new flags were added to `wbt_full_body_replay.py` for safer joint initialization:
+
+**`--init-sequential`** — Initialize joints in 5 sequential groups instead of all at once:
+1. left leg (joints 0–5)
+2. right leg (joints 6–11)
+3. waist (joints 12–14)
+4. left arm (joints 15–21)
+5. right arm (joints 22–28)
+
+Each group reaches its target pose before the next group starts.
+Use `--init-group-pause-s` (default 1.0s) to set the pause between groups.
+
+**`--init-joints`** — Initialize only specific joints by index, holding all others at their
+current position. Useful for testing individual joints without disturbing the whole body.
+
+```bash
+# Initialize only both ankles (left: 4,5 / right: 10,11)
+python unitree_lerobot/eval_robot/wbt_full_body_replay.py \
+  --episode=0 \
+  --max-steps=1 \
+  --frequency=30 \
+  --network-interface=enp1s0 \
+  --initialize-from-dataset \
+  --initialization-speed-rad-s=0.05 \
+  --initialization-max-error-rad=0.10 \
+  --init-joints=4,5,10,11 \
+  --max-body-delta-rad=0.005 \
+  --low-body-kp-scale=0.25 \
+  --arm-kp-scale=0.8 \
+  --no-hands \
+  --send-actions \
+  --control-confirmation=SEND_FULL_BODY_G1_WBT
+```
+
+Joint index reference:
+
+| Index | Joint | Index | Joint |
+|-------|-------|-------|-------|
+| 0 | left_hip_pitch | 15 | left_shoulder_pitch |
+| 1 | left_hip_roll | 16 | left_shoulder_roll |
+| 2 | left_hip_yaw | 17 | left_shoulder_yaw |
+| 3 | left_knee | 18 | left_elbow |
+| 4 | left_ankle_pitch | 19 | left_wrist_roll |
+| 5 | left_ankle_roll | 20 | left_wrist_pitch |
+| 6 | right_hip_pitch | 21 | left_wrist_yaw |
+| 7 | right_hip_roll | 22 | right_shoulder_pitch |
+| 8 | right_hip_yaw | 23 | right_shoulder_roll |
+| 9 | right_knee | 24 | right_shoulder_yaw |
+| 10 | right_ankle_pitch | 25 | right_elbow |
+| 11 | right_ankle_roll | 26 | right_wrist_roll |
+| 12 | waist_yaw | 27 | right_wrist_pitch |
+| 13 | waist_roll* | 28 | right_wrist_yaw |
+| 14 | waist_pitch* | | |
+
+*waist_roll and waist_pitch are INVALID on G1 29dof with waist locked.
+
 # 6. 🤔 Troubleshooting
 
 | Problem                                                                                                                                                                                                                                     | Solution                                                       |

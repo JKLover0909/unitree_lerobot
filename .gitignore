@@ -14,3 +14,7 @@ offline_infer_results/
 hybrid_arm_results/
 wbt_inspire_results/
 wbt_full_body_results/
+wbt_holosoma_results/
+wbt_cpp_replay_inputs/
+build/
+AGENT-read-This4G1-Edu/G1-Edu/

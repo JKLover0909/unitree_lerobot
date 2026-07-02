@@ -51,6 +51,11 @@ def parse_args() -> argparse.Namespace:
         help="LeRobot dataset repo id.",
     )
     parser.add_argument(
+        "--root",
+        default=None,
+        help="Optional local LeRobot dataset root. Use this for local/... datasets.",
+    )
+    parser.add_argument(
         "--policy-path",
         required=True,
         help="Path to checkpoint/pretrained_model containing model.safetensors and processors.",
@@ -221,10 +226,14 @@ def compute_metrics(gt: np.ndarray, pred: np.ndarray) -> tuple[dict[str, Any], l
 
     group_metrics = {}
     for name, group_slice in ACTION_GROUPS.items():
-        group_abs = abs_err[:, group_slice]
-        group_sq = squared_err[:, group_slice]
+        start = min(group_slice.start, gt.shape[1])
+        stop = min(group_slice.stop, gt.shape[1])
+        if start >= stop:
+            continue
+        group_abs = abs_err[:, start:stop]
+        group_sq = squared_err[:, start:stop]
         group_metrics[name] = {
-            "dims": [group_slice.start, group_slice.stop - 1],
+            "dims": [start, stop - 1],
             "mae": float(group_abs.mean()),
             "rmse": float(np.sqrt(group_sq.mean())),
             "max_abs_error": float(group_abs.max()),
@@ -289,10 +298,14 @@ def plot_group_overview(run_dir: Path, gt: np.ndarray, pred: np.ndarray) -> None
     x = np.arange(gt.shape[0])
 
     for ax, (group_name, group_slice) in zip(axes, ACTION_GROUPS.items(), strict=True):
-        for dim in range(group_slice.start, group_slice.stop):
+        start = min(group_slice.start, gt.shape[1])
+        stop = min(group_slice.stop, gt.shape[1])
+        if start >= stop:
+            continue
+        for dim in range(start, stop):
             ax.plot(x, gt[:, dim], color="blue", alpha=0.35, linewidth=1.0)
             ax.plot(x, pred[:, dim], color="red", alpha=0.35, linewidth=1.0, linestyle="--")
-        ax.set_title(f"{group_name} dims {group_slice.start + 1}-{group_slice.stop}")
+        ax.set_title(f"{group_name} dims {start + 1}-{stop}")
         ax.set_ylabel("Action")
         ax.grid(alpha=0.2)
 
@@ -374,11 +387,12 @@ def main() -> None:
     policy_path = Path(args.policy_path)
     run_dir = make_run_dir(output_root, args.run_name, args.episode, args.mode)
 
-    dataset = LeRobotDataset(repo_id=args.repo_id)
+    dataset = LeRobotDataset(repo_id=args.repo_id, root=args.root)
     policy_cfg, policy, preprocessor, postprocessor, device = load_policy_and_processors(policy_path, dataset)
 
     config = {
         "repo_id": args.repo_id,
+        "root": args.root,
         "policy_path": str(policy_path.resolve()),
         "episode": args.episode,
         "max_frames": args.max_frames,

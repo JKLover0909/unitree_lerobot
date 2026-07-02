@@ -202,6 +202,41 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--preview-only", action="store_true", help="Only print dataset summary and exit.")
     parser.add_argument("--print-every", type=int, default=50)
+    parser.add_argument(
+        "--init-sequential",
+        action="store_true",
+        help=(
+            "Initialize joints in 5 sequential groups instead of all at once: "
+            "1) left leg (0:6), 2) right leg (6:12), 3) waist (12:15), "
+            "4) left arm (15:22), 5) right arm (22:29). "
+            "Each group reaches target before the next group starts."
+        ),
+    )
+    parser.add_argument(
+        "--init-group-pause-s",
+        type=float,
+        default=1.0,
+        help="Pause in seconds between sequential init groups (default: 1.0s).",
+    )
+    parser.add_argument(
+        "--init-joints",
+        default=None,
+        help=(
+            "Comma-separated joint indices to initialize (e.g. '4,5,10,11' for both ankles). "
+            "Only these joints will be moved to the dataset initial pose; all others are held "
+            "at their current position. Cannot be used with --init-sequential. "
+            "Joint index reference: "
+            "0=left_hip_pitch, 1=left_hip_roll, 2=left_hip_yaw, 3=left_knee, "
+            "4=left_ankle_pitch, 5=left_ankle_roll, "
+            "6=right_hip_pitch, 7=right_hip_roll, 8=right_hip_yaw, 9=right_knee, "
+            "10=right_ankle_pitch, 11=right_ankle_roll, "
+            "12=waist_yaw, 13=waist_roll, 14=waist_pitch, "
+            "15=left_shoulder_pitch, 16=left_shoulder_roll, 17=left_shoulder_yaw, "
+            "18=left_elbow, 19=left_wrist_roll, 20=left_wrist_pitch, 21=left_wrist_yaw, "
+            "22=right_shoulder_pitch, 23=right_shoulder_roll, 24=right_shoulder_yaw, "
+            "25=right_elbow, 26=right_wrist_roll, 27=right_wrist_pitch, 28=right_wrist_yaw."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -218,6 +253,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--initialization-speed-rad-s must be positive")
     if args.send_actions and args.control_confirmation != CONTROL_CONFIRMATION:
         raise ValueError(f"Real full-body control requires --control-confirmation={CONTROL_CONFIRMATION}")
+    if args.init_joints is not None and getattr(args, "init_sequential", False):
+        raise ValueError("--init-joints and --init-sequential cannot be used together")
 
 
 def load_info(root: Path) -> dict[str, Any]:
@@ -454,20 +491,41 @@ class RobotIO:
     def current_body_q(self, max_age_s: float) -> np.ndarray:
         return self.reader.get(max_age_s)["q"]
 
-    def publish_body(self, q_target: np.ndarray, kp_scale_low_body: float, kp_scale_arm: float) -> None:
+    def publish_body(
+        self,
+        q_target: np.ndarray,
+        kp_scale_low_body: float,
+        kp_scale_arm: float,
+        active_joints: list[int] | None = None,
+    ) -> None:
+        """Publish low-level body command.
+
+        If active_joints is given, only those joints will have full kp/kd stiffness.
+        All other joints will be set to kp=0 / kd=0.5 (passive damping only) to
+        avoid noise and joint sounds when they are not being commanded.
+        """
         q_target = np.asarray(q_target, dtype=np.float32)
         if q_target.shape != (G1_MOTOR_DOF,):
             raise ValueError(f"Expected G1 body target shape ({G1_MOTOR_DOF},), got {q_target.shape}")
         kp = KP.copy()
         kp[:15] *= float(kp_scale_low_body)
         kp[15:] *= float(kp_scale_arm)
+        kd = KD.copy()
+
+        active_set = set(active_joints) if active_joints is not None else None
+
         for i in range(G1_MOTOR_DOF):
             self.low_cmd.motor_cmd[i].mode = 1
             self.low_cmd.motor_cmd[i].tau = 0.0
             self.low_cmd.motor_cmd[i].q = float(q_target[i])
             self.low_cmd.motor_cmd[i].dq = 0.0
-            self.low_cmd.motor_cmd[i].kp = float(kp[i])
-            self.low_cmd.motor_cmd[i].kd = float(KD[i])
+            if active_set is not None and i not in active_set:
+                # Passive damping only — no stiffness, no noise
+                self.low_cmd.motor_cmd[i].kp = 0.0
+                self.low_cmd.motor_cmd[i].kd = 0.5
+            else:
+                self.low_cmd.motor_cmd[i].kp = float(kp[i])
+                self.low_cmd.motor_cmd[i].kd = float(kd[i])
         self.low_cmd.mode_pr = 0
         self.low_cmd.mode_machine = self.mode_machine
         self.low_cmd.crc = self.crc.Crc(self.low_cmd)
@@ -549,6 +607,13 @@ def summarize_episode(ep: EpisodeInfo, q_desired: np.ndarray) -> None:
 
 
 def initialize_body(io: RobotIO, first_target: np.ndarray, args: argparse.Namespace) -> None:
+    if getattr(args, "init_sequential", False):
+        _initialize_body_sequential(io, first_target, args)
+        return
+    if getattr(args, "init_joints", None) is not None:
+        joint_indices = _parse_init_joints(args.init_joints)
+        _initialize_body_joints(io, first_target, args, joint_indices)
+        return
     print("Initializing full body to first dataset joint pose...")
     max_step = args.initialization_speed_rad_s / args.frequency
     start = time.monotonic()
@@ -568,6 +633,147 @@ def initialize_body(io: RobotIO, first_target: np.ndarray, args: argparse.Namesp
             print(f"Initializing body: elapsed={now - start:.1f}s max_error={error:.3f} rad")
             last_print = now
         time.sleep(1.0 / args.frequency)
+
+
+def _parse_init_joints(init_joints_str: str) -> list[int]:
+    """Parse comma-separated joint indices string into a sorted list of ints."""
+    try:
+        indices = [int(x.strip()) for x in init_joints_str.split(",") if x.strip()]
+    except ValueError as exc:
+        raise ValueError(f"--init-joints must be comma-separated integers, got: {init_joints_str!r}") from exc
+    invalid = [i for i in indices if not (0 <= i < G1_MOTOR_DOF)]
+    if invalid:
+        raise ValueError(f"--init-joints contains out-of-range indices {invalid}; valid range 0..{G1_MOTOR_DOF - 1}")
+    return sorted(set(indices))
+
+
+def _initialize_body_joints(
+    io: RobotIO,
+    first_target: np.ndarray,
+    args: argparse.Namespace,
+    joint_indices: list[int],
+) -> None:
+    """Move only the specified joints to the dataset initial pose.
+
+    All other joints are held at their current position. Useful for isolating
+    specific joints (e.g. ankles: 4,5,10,11) without disturbing the rest of
+    the body.
+    """
+    names = [G1_JOINT_NAMES[i] for i in joint_indices]
+    max_step = args.initialization_speed_rad_s / args.frequency
+    start = time.monotonic()
+    last_print = 0.0
+
+    print(
+        f"Initializing selected joints {joint_indices} "
+        f"({', '.join(names)}) to dataset pose ..."
+    )
+
+    while True:
+        current = io.current_body_q(args.state_timeout_s)
+
+        # Only move the selected joints; hold all others at current position
+        command = current.copy()
+        for i in joint_indices:
+            command[i] = current[i] + np.clip(
+                first_target[i] - current[i], -max_step, max_step
+            )
+
+        io.publish_body(command, args.low_body_kp_scale, args.arm_kp_scale, active_joints=joint_indices)
+
+        errors = np.abs(first_target[joint_indices] - current[joint_indices])
+        max_error = float(np.max(errors))
+
+        now = time.monotonic()
+        elapsed = now - start
+        if now - last_print >= 1.0:
+            per_joint = ", ".join(
+                f"{G1_JOINT_NAMES[i]}={errors[k]:.3f}" for k, i in enumerate(joint_indices)
+            )
+            print(f"  elapsed={elapsed:.1f}s max_error={max_error:.3f} rad [{per_joint}]")
+            last_print = now
+
+        if elapsed > args.initialization_timeout_s:
+            raise TimeoutError(
+                f"Timed out initializing joints {joint_indices}: max_error={max_error:.3f} rad"
+            )
+
+        if max_error <= args.initialization_max_error_rad:
+            print(f"Selected joints reached target: max_error={max_error:.3f} rad")
+            return
+
+        time.sleep(1.0 / args.frequency)
+
+
+# 5 groups: left leg, right leg, waist, left arm, right arm
+_INIT_GROUPS = [
+    ("left_leg",  slice(0,  6)),
+    ("right_leg", slice(6,  12)),
+    ("waist",     slice(12, 15)),
+    ("left_arm",  slice(15, 22)),
+    ("right_arm", slice(22, 29)),
+]
+
+
+def _initialize_body_sequential(io: RobotIO, first_target: np.ndarray, args: argparse.Namespace) -> None:
+    """Initialize joints group by group in sequence.
+
+    Each group moves only its own joints toward the dataset target while all
+    other joints are held at their current position. The next group only starts
+    after the current group's max_error drops below --initialization-max-error-rad.
+    """
+    max_step = args.initialization_speed_rad_s / args.frequency
+    pause_s = getattr(args, "init_group_pause_s", 1.0)
+
+    print(
+        f"Sequential init: 5 groups, speed={args.initialization_speed_rad_s} rad/s, "
+        f"pause={pause_s}s between groups"
+    )
+
+    for group_idx, (group_name, group_slice) in enumerate(_INIT_GROUPS):
+        print(
+            f"\n[{group_idx + 1}/5] Initializing {group_name} "
+            f"(joints {group_slice.start}:{group_slice.stop}) ..."
+        )
+        start = time.monotonic()
+        last_print = 0.0
+
+        while True:
+            current = io.current_body_q(args.state_timeout_s)
+
+            # Only move the active group; hold all other joints at current position
+            command = current.copy()
+            command[group_slice] = clip_step(
+                first_target[group_slice], current[group_slice], max_step
+            )
+
+            active_joints = list(range(group_slice.start, group_slice.stop))
+            io.publish_body(command, args.low_body_kp_scale, args.arm_kp_scale, active_joints=active_joints)
+
+            group_error = float(np.max(np.abs(first_target[group_slice] - current[group_slice])))
+
+            now = time.monotonic()
+            elapsed = now - start
+            if now - last_print >= 1.0:
+                print(f"  {group_name}: elapsed={elapsed:.1f}s group_error={group_error:.3f} rad")
+                last_print = now
+
+            if elapsed > args.initialization_timeout_s:
+                raise TimeoutError(
+                    f"Timed out initializing {group_name}: group_error={group_error:.3f} rad"
+                )
+
+            if group_error <= args.initialization_max_error_rad:
+                print(f"  {group_name} reached: group_error={group_error:.3f} rad")
+                break
+
+            time.sleep(1.0 / args.frequency)
+
+        if group_idx < len(_INIT_GROUPS) - 1 and pause_s > 0:
+            print(f"  Pausing {pause_s:.1f}s before next group...")
+            time.sleep(pause_s)
+
+    print("Sequential init complete: all 5 groups at target.")
 
 
 def replay_episode(

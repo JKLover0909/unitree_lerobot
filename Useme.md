@@ -14,6 +14,86 @@ Nhánh hiện tại:
 son-deploy-WBT
 ```
 
+## C++ WBT Full-Body Replay Nhanh
+
+Flow này dùng Python để export raw dataset ra CSV, rồi dùng C++ `unitree_sdk2` để gửi 29 khớp body G1 qua `rt/lowcmd`.
+
+Build:
+
+```bash
+cd /home/jkl0909/code/Son/unitree_lerobot
+
+cmake -S unitree_lerobot/eval_robot/cpp \
+  -B build/wbt_cpp_replay \
+  -DCMAKE_PREFIX_PATH=/usr/local
+
+cmake --build build/wbt_cpp_replay -j"$(nproc)"
+```
+
+Export CSV:
+
+```bash
+python unitree_lerobot/eval_robot/export_wbt_full_body_csv.py \
+  --episode=0 \
+  --episode-count=1 \
+  --max-steps=30 \
+  --output=wbt_cpp_replay_inputs/episode0_30.csv
+```
+
+Dry-run C++:
+
+```bash
+./build/wbt_cpp_replay/g1_wbt_body_replay \
+  --input-csv=wbt_cpp_replay_inputs/episode0_30.csv \
+  --frequency=30 \
+  --print-every=10
+```
+
+Real robot C++ test ngắn, chỉ init cổ chân:
+
+```bash
+./build/wbt_cpp_replay/g1_wbt_body_replay \
+  --input-csv=wbt_cpp_replay_inputs/episode0_30.csv \
+  --network-interface=enp1s0 \
+  --frequency=30 \
+  --initialize-from-first-row \
+  --initialization-speed-rad-s=0.05 \
+  --initialization-max-error-rad=0.10 \
+  --initialization-timeout-s=60 \
+  --init-joints=4,5,10,11 \
+  --max-body-delta-rad=0.005 \
+  --low-body-kp-scale=0.25 \
+  --arm-kp-scale=0.8 \
+  --send-actions \
+  --control-confirmation=SEND_FULL_BODY_G1_WBT
+```
+
+Real robot C++ init tuần tự 5 nhóm:
+
+```bash
+./build/wbt_cpp_replay/g1_wbt_body_replay \
+  --input-csv=wbt_cpp_replay_inputs/episode0_30.csv \
+  --network-interface=enp1s0 \
+  --frequency=30 \
+  --initialize-from-first-row \
+  --initialization-speed-rad-s=0.05 \
+  --initialization-max-error-rad=0.10 \
+  --initialization-timeout-s=180 \
+  --init-sequential \
+  --init-group-pause-s=2.0 \
+  --max-body-delta-rad=0.005 \
+  --low-body-kp-scale=0.25 \
+  --arm-kp-scale=0.8 \
+  --send-actions \
+  --control-confirmation=SEND_FULL_BODY_G1_WBT
+```
+
+Chi tiết hơn nằm ở:
+
+```text
+unitree_lerobot/eval_robot/WBT_FULL_BODY_REPLAY.md
+```
+
 ## 0. Chuẩn Bị Chung
 
 Activate môi trường đúng:
@@ -74,6 +154,93 @@ Raw dataset mặc định:
 
 ```text
 /home/jkl0909/.cache/huggingface/lerobot/unitreerobotics/G1_WBT_Inspire_Pick_Up_Drinks_raw3tmp
+```
+
+### Các flag init mới (thêm 2026-06-26)
+
+Script `wbt_full_body_replay.py` đã được cập nhật thêm 2 flag để kiểm soát quá trình khởi tạo tư thế an toàn hơn:
+
+**`--init-sequential`**: Khởi tạo theo 5 nhóm tuần tự thay vì đẩy toàn bộ 29 khớp cùng lúc.
+Thứ tự: chân trái (0:6) → chân phải (6:12) → eo (12:15) → tay trái (15:22) → tay phải (22:29).
+Mỗi nhóm đạt target trước rồi mới chuyển sang nhóm tiếp theo.
+
+```bash
+--init-sequential \
+--init-group-pause-s=2.0
+```
+
+**`--init-joints`**: Chỉ khởi tạo các khớp cụ thể theo index, giữ nguyên tất cả khớp còn lại.
+Dùng để test từng phần (ví dụ chỉ đưa cổ chân về pose đầu).
+
+```bash
+# Chỉ init 2 cổ chân:
+--init-joints=4,5,10,11
+```
+
+Index joint tham khảo:
+
+```text
+0  = left_hip_pitch      6  = right_hip_pitch
+1  = left_hip_roll       7  = right_hip_roll
+2  = left_hip_yaw        8  = right_hip_yaw
+3  = left_knee           9  = right_knee
+4  = left_ankle_pitch    10 = right_ankle_pitch
+5  = left_ankle_roll     11 = right_ankle_roll
+12 = waist_yaw           15 = left_shoulder_pitch
+13 = waist_roll          16 = left_shoulder_roll
+14 = waist_pitch         17 = left_shoulder_yaw
+                         18 = left_elbow
+22 = right_shoulder_pitch  19 = left_wrist_roll
+23 = right_shoulder_roll   20 = left_wrist_pitch
+24 = right_shoulder_yaw    21 = left_wrist_yaw
+25 = right_elbow
+26 = right_wrist_roll
+27 = right_wrist_pitch
+28 = right_wrist_yaw
+```
+
+Lưu ý: `--init-joints` và `--init-sequential` không dùng cùng nhau được.
+
+### Lệnh init chỉ cổ chân
+
+```bash
+python unitree_lerobot/eval_robot/wbt_full_body_replay.py \
+  --episode=0 \
+  --max-steps=1 \
+  --frequency=30 \
+  --network-interface=enp1s0 \
+  --initialize-from-dataset \
+  --initialization-speed-rad-s=0.05 \
+  --initialization-max-error-rad=0.10 \
+  --initialization-timeout-s=60 \
+  --init-joints=4,5,10,11 \
+  --max-body-delta-rad=0.005 \
+  --low-body-kp-scale=0.25 \
+  --arm-kp-scale=0.8 \
+  --no-hands \
+  --send-actions \
+  --control-confirmation=SEND_FULL_BODY_G1_WBT
+```
+
+### Lệnh init sequential 5 nhóm
+
+```bash
+python unitree_lerobot/eval_robot/wbt_full_body_replay.py \
+  --episode=0 \
+  --max-steps=30 \
+  --frequency=30 \
+  --network-interface=enp1s0 \
+  --initialize-from-dataset \
+  --initialization-speed-rad-s=0.05 \
+  --initialization-max-error-rad=0.10 \
+  --init-sequential \
+  --init-group-pause-s=2.0 \
+  --max-body-delta-rad=0.005 \
+  --low-body-kp-scale=0.25 \
+  --arm-kp-scale=0.8 \
+  --no-hands \
+  --send-actions \
+  --control-confirmation=SEND_FULL_BODY_G1_WBT
 ```
 
 Format action raw:
@@ -902,3 +1069,56 @@ Kết luận hiện tại:
 - Đã có lớp `ImageServer/ImageClient` để stream head/wrist camera qua ZMQ/WebRTC.
 - `wbt_inspire_hybrid_infer.py` chưa dùng camera live; nó vẫn lấy ảnh/video từ dataset rồi thay state thật của tay/cánh tay vào.
 - Muốn deploy policy bằng camera thật cần thêm bước nối `ImageClient` vào observation và phải đúng key camera mà checkpoint đã train.
+
+## 14. Debug Chân Không Về Init Pose
+
+Khi chỉ đưa phần chân về pose đầu dataset mà `max_error` không giảm hoặc không bao giờ báo reached, dùng script này để tách lỗi:
+
+```text
+unitree_lerobot/eval_robot/debug_wbt_leg_init.py
+```
+
+Script mặc định **chỉ đọc**, không gửi lệnh robot. Nó sẽ:
+
+- Load target pose đầu episode từ raw WBT dataset.
+- Đọc `rt/lowstate`.
+- In bảng `current / target / error` cho 12 khớp chân.
+- Chỉ ra khớp nào đang làm `max_error` lớn nhất.
+
+Read-only debug:
+
+```bash
+cd /home/jkl0909/code/Son/unitree_lerobot
+conda activate unitree_lerobot
+
+python unitree_lerobot/eval_robot/debug_wbt_leg_init.py \
+  --root=/home/jkl0909/.cache/huggingface/lerobot/unitreerobotics/G1_WBT_Inspire_Pick_Up_Drinks_raw3tmp \
+  --episode=0 \
+  --network-interface=enp1s0 \
+  --init-joints=0,1,2,3,4,5,6,7,8,9,10,11 \
+  --initialization-max-error-rad=0.10
+```
+
+Nếu muốn kiểm tra robot có nhận lệnh low-level cho một khớp chân hay không, dùng probe rất nhỏ. Ví dụ probe cổ chân trái pitch `joint=4`:
+
+```bash
+python unitree_lerobot/eval_robot/debug_wbt_leg_init.py \
+  --root=/home/jkl0909/.cache/huggingface/lerobot/unitreerobotics/G1_WBT_Inspire_Pick_Up_Drinks_raw3tmp \
+  --episode=0 \
+  --network-interface=enp1s0 \
+  --init-joints=0,1,2,3,4,5,6,7,8,9,10,11 \
+  --low-body-kp-scale=0.20 \
+  --send-probe \
+  --probe-joint=4 \
+  --probe-delta-rad=0.02 \
+  --probe-duration-s=2.0 \
+  --probe-support-selected-joints \
+  --control-confirmation=SEND_WBT_LEG_DEBUG_PROBE
+```
+
+Đọc kết quả:
+
+- Nếu `moved` gần `0.000`, khả năng cao lệnh chân bị motion/balance mode chặn hoặc override.
+- Nếu `moved` có thay đổi, command path có tác dụng; khi đó xem bảng error để biết khớp nào còn lệch hoặc giảm tốc/giảm ngưỡng init.
+- `--probe-support-selected-joints` giữ cứng toàn bộ các khớp trong `--init-joints` ở vị trí hiện tại, rồi chỉ dịch nhẹ khớp probe. Cách này công bằng hơn cho chân vì một khớp đơn lẻ thường khó thắng tải nếu các khớp còn lại passive.
+- Không dùng `--release-motion-mode` nếu robot không được treo/đỡ an toàn.

@@ -334,7 +334,141 @@ Không publish command tới một bên tay.
 
 Gọi MotionSwitcher `ReleaseMode()` trước khi low-level control. Chỉ dùng khi chủ động chuyển sang full-body low-level, vì robot có thể mất balance nếu command không đúng.
 
-## 9. Mapping
+## 9. C++ Body Replay
+
+Ngoài script Python `wbt_full_body_replay.py`, repo có thêm flow C++ để chuyển phần gửi lệnh 29 khớp G1 sang `unitree_sdk2` C++.
+
+Nếu muốn đi giống repo Holosoma hơn, ưu tiên dùng:
+
+```bash
+python unitree_lerobot/eval_robot/wbt_holosoma_unitree_replay.py \
+  --episode=0 \
+  --episode-count=1 \
+  --max-steps=30 \
+  --frequency=30 \
+  --preview-only
+```
+
+Backend này không tự publish `rt/lowcmd`; nó dùng binding C++/pybind11 `unitree_interface` giống Holosoma:
+
+```text
+create_robot -> read_low_state -> create_zero_command -> write_low_command
+```
+
+Nếu thiếu binding, cài wheel `unitree_sdk2` từ `amazon-far/unitree_sdk2` giống hướng dẫn trong `Useme-C.md`.
+
+Ý tưởng:
+
+```text
+Python export raw dataset -> CSV q0..q28
+C++ g1_wbt_body_replay    -> rt/lowcmd / rt/lowstate
+```
+
+Ở bản đầu, C++ replay chỉ điều khiển 29 khớp body G1. Inspire hand vẫn dùng pipeline Python/bridge riêng nếu cần.
+
+Build binary:
+
+```bash
+cd /home/jkl0909/code/Son/unitree_lerobot
+
+cmake -S unitree_lerobot/eval_robot/cpp \
+  -B build/wbt_cpp_replay \
+  -DCMAKE_PREFIX_PATH=/usr/local
+
+cmake --build build/wbt_cpp_replay -j"$(nproc)"
+```
+
+Export episode từ raw dataset sang CSV:
+
+```bash
+python unitree_lerobot/eval_robot/export_wbt_full_body_csv.py \
+  --episode=0 \
+  --episode-count=1 \
+  --max-steps=30 \
+  --output=wbt_cpp_replay_inputs/episode0_30.csv
+```
+
+Dry-run C++ không gửi lệnh robot:
+
+```bash
+./build/wbt_cpp_replay/g1_wbt_body_replay \
+  --input-csv=wbt_cpp_replay_inputs/episode0_30.csv \
+  --frequency=30 \
+  --print-every=10 \
+  --log-csv=/tmp/wbt_cpp_replay_log.csv
+```
+
+Real robot, test rất ngắn, chỉ init cổ chân:
+
+```bash
+./build/wbt_cpp_replay/g1_wbt_body_replay \
+  --input-csv=wbt_cpp_replay_inputs/episode0_30.csv \
+  --network-interface=enp1s0 \
+  --frequency=30 \
+  --initialize-from-first-row \
+  --initialization-speed-rad-s=0.05 \
+  --initialization-max-error-rad=0.10 \
+  --initialization-timeout-s=60 \
+  --init-joints=4,5,10,11 \
+  --max-body-delta-rad=0.005 \
+  --low-body-kp-scale=0.25 \
+  --arm-kp-scale=0.8 \
+  --send-actions \
+  --control-confirmation=SEND_FULL_BODY_G1_WBT
+```
+
+Real robot, chỉ init 2 cánh tay qua `rt/arm_sdk`:
+
+```bash
+./build/wbt_cpp_replay/g1_wbt_body_replay \
+  --input-csv=wbt_cpp_replay_inputs/episode0_30.csv \
+  --network-interface=enp1s0 \
+  --frequency=30 \
+  --initialize-from-first-row \
+  --init-only \
+  --arm-sdk \
+  --init-joints=15,16,17,18,19,20,21,22,23,24,25,26,27,28 \
+  --initialization-speed-rad-s=0.05 \
+  --initialization-max-error-rad=0.10 \
+  --initialization-timeout-s=120 \
+  --max-body-delta-rad=0.005 \
+  --low-body-kp-scale=0.25 \
+  --arm-kp-scale=0.8 \
+  --send-actions \
+  --control-confirmation=SEND_FULL_BODY_G1_WBT
+```
+
+Nếu log `G1 MotionSwitcher` vẫn báo `name=ai`, `rt/lowcmd` có thể bị motion service chặn. Với riêng eo/tay, ưu tiên `--arm-sdk` để giữ robot ở mode cân bằng.
+
+Real robot, init tuần tự 5 nhóm:
+
+```bash
+./build/wbt_cpp_replay/g1_wbt_body_replay \
+  --input-csv=wbt_cpp_replay_inputs/episode0_30.csv \
+  --network-interface=enp1s0 \
+  --frequency=30 \
+  --initialize-from-first-row \
+  --initialization-speed-rad-s=0.05 \
+  --initialization-max-error-rad=0.10 \
+  --initialization-timeout-s=180 \
+  --init-sequential \
+  --init-group-pause-s=2.0 \
+  --max-body-delta-rad=0.005 \
+  --low-body-kp-scale=0.25 \
+  --arm-kp-scale=0.8 \
+  --send-actions \
+  --control-confirmation=SEND_FULL_BODY_G1_WBT
+```
+
+Sau init, C++ cũng dừng lại và hỏi:
+
+```text
+Initial pose stage done. Enter 's' to start C++ full-body replay, anything else to stop:
+```
+
+Chỉ nhập `s` khi robot đang được treo/đỡ an toàn và tư thế init ổn.
+
+## 10. Mapping
 
 `action.robot_q_desired` có 36 chiều:
 
