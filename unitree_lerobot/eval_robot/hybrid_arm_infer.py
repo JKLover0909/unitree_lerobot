@@ -150,14 +150,24 @@ def episode_bounds(dataset: LeRobotDataset, episode: int, start_frame: int) -> t
 
 def load_policy_and_processors(policy_path: Path, dataset: LeRobotDataset):
     policy_cfg = PreTrainedConfig.from_pretrained(policy_path)
-    if policy_cfg.type != "act":
-        raise ValueError(f"This entry point requires an ACT checkpoint, got policy type {policy_cfg.type!r}")
+    if policy_cfg.type not in ("act", "act_lite"):
+        raise ValueError(f"This entry point requires an ACT or ACT-Lite checkpoint, got policy type {policy_cfg.type!r}")
+
     state_feature = policy_cfg.input_features.get("observation.state")
     action_feature = policy_cfg.output_features.get("action")
-    if state_feature is None or tuple(state_feature.shape) != (FULL_STATE_DOF,):
-        raise ValueError(f"Checkpoint observation.state must have shape ({FULL_STATE_DOF},)")
-    if action_feature is None or tuple(action_feature.shape) != (FULL_STATE_DOF,):
-        raise ValueError(f"Checkpoint action must have shape ({FULL_STATE_DOF},)")
+
+    if policy_cfg.type == "act_lite":
+        # ACT-Lite: native 14D
+        if state_feature is None or tuple(state_feature.shape) != (ARM_DOF,):
+            raise ValueError(f"ACT-Lite checkpoint observation.state must have shape ({ARM_DOF},)")
+        if action_feature is None or tuple(action_feature.shape) != (ARM_DOF,):
+            raise ValueError(f"ACT-Lite checkpoint action must have shape ({ARM_DOF},)")
+    else:
+        # ACT: 26D or 28D
+        if state_feature is None or tuple(state_feature.shape) != (FULL_STATE_DOF,):
+            raise ValueError(f"Checkpoint observation.state must have shape ({FULL_STATE_DOF},)")
+        if action_feature is None or tuple(action_feature.shape) != (FULL_STATE_DOF,):
+            raise ValueError(f"Checkpoint action must have shape ({FULL_STATE_DOF},)")
     policy_cfg.pretrained_path = policy_path
     device = get_safe_torch_device(policy_cfg.device, log=True)
     policy = make_policy(cfg=policy_cfg, ds_meta=dataset.meta)
@@ -182,7 +192,11 @@ def predict_full_action_chunk(
     postprocessor,
     device: torch.device,
 ) -> np.ndarray:
-    """Run ACT once and return the unnormalized chunk with shape (T, 28)."""
+    """Run ACT/ACT-Lite once and return the unnormalized chunk.
+
+    For ACT: returns shape (T, FULL_STATE_DOF) e.g. (T, 28).
+    For ACT-Lite: returns shape (T, ARM_DOF) e.g. (T, 14).
+    """
     batch = {}
     for name, value in observation.items():
         if not hasattr(value, "unsqueeze"):
@@ -202,8 +216,11 @@ def predict_full_action_chunk(
         chunk = postprocessor(chunk)
 
     chunk_np = chunk.squeeze(0).detach().cpu().numpy()
-    if chunk_np.ndim != 2 or chunk_np.shape[1] != FULL_STATE_DOF:
-        raise ValueError(f"Expected policy output (T, {FULL_STATE_DOF}), got {chunk_np.shape}")
+    # Accept both native 14D (ACT-Lite) and full 26D/28D (ACT)
+    if chunk_np.ndim != 2 or chunk_np.shape[1] not in (ARM_DOF, FULL_STATE_DOF):
+        raise ValueError(
+            f"Expected policy output (T, {ARM_DOF}) or (T, {FULL_STATE_DOF}), got {chunk_np.shape}"
+        )
     return chunk_np
 
 

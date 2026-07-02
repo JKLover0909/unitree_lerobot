@@ -14,8 +14,8 @@ def compose_hybrid_state(dataset_state, real_arm_state) -> np.ndarray:
     dataset = np.asarray(dataset_state, dtype=np.float32).reshape(-1)
     real_arm = np.asarray(real_arm_state, dtype=np.float32).reshape(-1)
 
-    if dataset.shape != (FULL_STATE_DOF,):
-        raise ValueError(f"Expected dataset state shape ({FULL_STATE_DOF},), got {dataset.shape}")
+    if dataset.shape not in ((FULL_STATE_DOF,), (ARM_DOF,)):
+        raise ValueError(f"Expected dataset state shape ({FULL_STATE_DOF},) or ({ARM_DOF},), got {dataset.shape}")
     if real_arm.shape != (ARM_DOF,):
         raise ValueError(f"Expected real arm state shape ({ARM_DOF},), got {real_arm.shape}")
     if not np.all(np.isfinite(dataset)):
@@ -31,8 +31,8 @@ def compose_hybrid_state(dataset_state, real_arm_state) -> np.ndarray:
 def extract_arm_chunk(action_chunk) -> np.ndarray:
     """Validate a full ACT chunk and return its first 14 action dimensions."""
     actions = np.asarray(action_chunk, dtype=np.float32)
-    if actions.ndim != 2 or actions.shape[1] != FULL_STATE_DOF:
-        raise ValueError(f"Expected action chunk shape (T, {FULL_STATE_DOF}), got {actions.shape}")
+    if actions.ndim != 2 or actions.shape[1] not in (FULL_STATE_DOF, ARM_DOF):
+        raise ValueError(f"Expected action chunk shape (T, {FULL_STATE_DOF}) or (T, {ARM_DOF}), got {actions.shape}")
     if actions.shape[0] == 0:
         raise ValueError("Action chunk is empty")
     if not np.all(np.isfinite(actions)):
