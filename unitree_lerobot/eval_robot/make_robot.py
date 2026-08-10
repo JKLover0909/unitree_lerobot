@@ -74,7 +74,7 @@ def setup_image_client(args: argparse.Namespace) -> dict[str, Any]:
     """Initializes and starts the image client and shared memory."""
     # image client: img_config should be the same as the configuration in image_server.py (of Robot's development computing unit)
     
-    image_client = ImageClient(host=args.image_host, request_bgr=True)
+    image_client = ImageClient(host=getattr(args, "image_host", "127.0.0.1"), request_bgr=True)
     image_config = image_client.get_cam_config()
     return image_client, image_config
 

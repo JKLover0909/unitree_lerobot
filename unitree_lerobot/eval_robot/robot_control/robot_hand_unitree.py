@@ -4,7 +4,10 @@ from unitree_sdk2py.idl.unitree_hg.msg.dds_ import HandCmd_, HandState_  # idl
 from unitree_sdk2py.idl.default import unitree_hg_msg_dds__HandCmd_
 
 # for gripper
-from unitree_sdk2py.idl.unitree_go.msg.dds_ import MotorCmds_, MotorStates_  # idl
+try:
+    from unitree_sdk2py.idl.unitree_go.msg.dds_ import MotorCmds_, MotorStates_  # idl
+except ImportError:
+    MotorCmds_, MotorStates_ = None, None
 from unitree_sdk2py.idl.default import unitree_go_msg_dds__MotorCmd_
 
 import numpy as np

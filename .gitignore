@@ -18,3 +18,23 @@ wbt_holosoma_results/
 wbt_cpp_replay_inputs/
 build/
 AGENT-read-This4G1-Edu/G1-Edu/
+
+# Generated experiment/data artifacts
+*.csv
+*.tsv
+*.log
+*.tmp
+*.npy
+*.npz
+*.parquet
+*.safetensors
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.png
+
+# Local checkpoints and robot replay logs
+checkpoints/
+recorded_arm14_replay_results/
+hybrid_arm_result_replay_results/

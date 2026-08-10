@@ -4,6 +4,88 @@ File này bàn giao cho agent đang làm việc trực tiếp trên máy robot/N
 
 Mục tiêu hiện tại: kết nối và lấy ảnh từ camera đầu G1 để sau này dùng thay video dataset khi deploy policy hoặc tự thu dataset mới.
 
+## 0. Cập Nhật Repo Mới Nhất 2026-07-03
+
+Repo hiện đã chuyển sang hướng mới gọn hơn cho bài toán:
+
+```text
+1 camera đầu G1 + 14 khớp cánh tay G1
+```
+
+Nhánh đang dùng:
+
+```text
+son-train-newACT-headcam-fake-flat26
+```
+
+Commit mới nhất đã làm các việc chính:
+
+```text
+Convert lerobot submodule to internal repo, add ACT-Lite policy and native dataset script
+```
+
+Các thay đổi quan trọng:
+
+- `unitree_lerobot/lerobot/` không còn là submodule rời, đã được đưa thành mã nguồn nội bộ trong repo này.
+- Thêm policy mới `act_lite` tại:
+
+```text
+unitree_lerobot/lerobot/src/lerobot/policies/act_lite/
+```
+
+- Thêm script tạo dataset native:
+
+```text
+scripts/make_native_headcam_arm14.py
+```
+
+- Thêm tài liệu train:
+
+```text
+TRAIN_ACT_LITE.md
+```
+
+- `hybrid_arm_infer.py` đã hỗ trợ cả:
+
+```text
+ACT gốc      output 26D/28D -> slice 14 khớp cánh tay
+ACT-Lite     output 14D     -> dùng trực tiếp cho 14 khớp cánh tay
+```
+
+- Dataset episode raw đã được đưa vào repo:
+
+```text
+episode_20260629_172043/
+  metadata.json
+  timestamps.csv
+  states/arm14.csv
+  videos/head.mp4
+```
+
+- Checkpoint ACT-Lite mới đang nằm local trong:
+
+```text
+checkpoints/act_lite_010000_pretrained_model/pretrained_model/
+```
+
+Checkpoint này có config:
+
+```text
+policy.type = act_lite
+observation.state shape = [14]
+observation.images.head shape = [3, 480, 640]
+action shape = [14]
+chunk_size = 100
+n_action_steps = 100
+vision_backbone = resnet18
+```
+
+Nói ngắn gọn: hướng mới không còn cần fake 4 camera và fake 12 khớp bàn tay nữa. Policy mới chỉ học đúng thứ hiện có thật:
+
+```text
+head camera thật + 14 q cánh tay thật -> 14 action cánh tay
+```
+
 ## 1. Kết Luận Quan Trọng
 
 Camera trên đầu G1 EDU là:
@@ -351,7 +433,22 @@ camera RGB từ D435i
 
 Không cần full-body/root pose nếu chỉ train/deploy pipeline `flat26`.
 
-Dataset nên hướng tới:
+Với hướng mới ACT-Lite, nếu chỉ điều khiển 14 khớp cánh tay, dataset nên hướng tới:
+
+```text
+observation.images.head
+observation.state        shape [14]
+action                   shape [14]
+```
+
+Trong đó:
+
+```text
+state[0:14]   = 14 khớp hai cánh tay G1
+action[0:14]  = target arm q
+```
+
+Format `flat26` bên dưới là hướng legacy khi muốn thêm Inspire hand:
 
 ```text
 observation.images.head
@@ -582,7 +679,7 @@ dùng T-1 sample, bỏ sample cuối
 
 ### 12.2. Convert Sang flat26 Cho Cánh Tay + Inspire Hand
 
-Đây là hướng nên ưu tiên trước vì pipeline deploy hiện đã chạy tốt.
+Đây là hướng legacy đã chạy tốt cho cánh tay + Inspire hand. Nếu bài toán hiện tại chỉ dùng head camera + 14 khớp cánh tay thì ưu tiên hướng native arm14 + ACT-Lite ở mục 14.
 
 Cần record thêm Inspire hand state/cmd. Lowstate recorder chỉ có G1 body, chưa có hand FTP state.
 
@@ -733,7 +830,15 @@ camera wall_time_s và lowstate wall_time_s phải cùng hệ clock
 
 4. Copy raw log về laptop hoặc convert ngay trên robot.
 
-5. Convert ưu tiên sang `flat26` trước:
+5. Convert ưu tiên sang native arm14 trước nếu chỉ điều khiển cánh tay:
+
+```text
+observation.images.head
+observation.state[14]
+action[14]
+```
+
+6. Chỉ dùng `flat26` nếu cần cả Inspire hand:
 
 ```text
 observation.images.head
@@ -741,4 +846,210 @@ observation.state[26]
 action[26]
 ```
 
-6. Chỉ convert sang raw36/full-body nếu thật sự cần full-body training, vì root position hiện chưa có nguồn chuẩn.
+7. Chỉ convert sang raw36/full-body nếu thật sự cần full-body training, vì root position hiện chưa có nguồn chuẩn.
+
+## 14. Pipeline Mới: Native Headcam Arm14 + ACT-Lite
+
+Phần này là hướng mới nhất và nên ưu tiên hơn `flat26` nếu mục tiêu chỉ là:
+
+```text
+camera đầu G1 + 14 khớp cánh tay G1
+```
+
+### 14.1. Vì Sao Có Pipeline Mới
+
+Pipeline cũ `fake flat26` làm như sau:
+
+```text
+1 video headcam -> nhân thành 4 video key
+14 khớp tay thật -> cộng thêm 12 khớp Inspire hand giả/cố định
+policy ACT gốc input/output 26D
+```
+
+Cách đó chạy được về mặt kỹ thuật, nhưng có 2 nhược điểm:
+
+```text
+1. Policy phải xử lý 4 camera trùng nhau, tốn compute vô ích.
+2. State/action có 12 chiều hand giả, không phản ánh hệ thật hiện tại.
+```
+
+Pipeline mới dùng ACT-Lite:
+
+```text
+1 video key duy nhất: observation.images.head
+state 14D: 14 khớp hai cánh tay G1
+action 14D: target 14 khớp hai cánh tay G1
+```
+
+### 14.2. Dataset Raw Episode Đang Có Trong Repo
+
+Raw episode hiện có:
+
+```text
+episode_20260629_172043/
+  metadata.json
+  timestamps.csv
+  states/arm14.csv
+  videos/head.mp4
+```
+
+Ý nghĩa:
+
+```text
+videos/head.mp4       video RGB từ D435i/head camera
+states/arm14.csv      q15..q28 của G1, tức 14 khớp hai cánh tay
+timestamps.csv        timestamp theo frame/sample
+metadata.json         metadata record episode
+```
+
+### 14.3. Tạo Dataset Native 14D
+
+Chạy trên máy có repo:
+
+```bash
+cd /home/jkl0909/code/Son/unitree_lerobot
+conda activate unitree_lerobot
+
+python scripts/make_native_headcam_arm14.py \
+  --episode-dir episode_20260629_172043 \
+  --overwrite
+```
+
+Output mặc định:
+
+```text
+~/.cache/huggingface/lerobot/local/episode_20260629_172043_native_arm14_k1/
+```
+
+Format output:
+
+```text
+observation.state          shape [14]
+action                     shape [14]
+observation.images.head    video [3, 480, 640]
+```
+
+Action vẫn dùng cách fake đơn giản:
+
+```text
+action[t] = state[t + 1]
+```
+
+Do đó nếu raw episode có `T` frame thì dataset train có `T - 1` sample.
+
+### 14.4. Train ACT-Lite
+
+Dry-run nhanh:
+
+```bash
+cd /home/jkl0909/code/Son/unitree_lerobot/unitree_lerobot/lerobot
+conda activate unitree_lerobot
+
+python -m lerobot.scripts.lerobot_train \
+  --policy.type=act_lite \
+  --dataset.repo_id=local/episode_20260629_172043_native_arm14_k1 \
+  --dataset.root=$HOME/.cache/huggingface/lerobot/local/episode_20260629_172043_native_arm14_k1 \
+  --batch_size=2 \
+  --steps=10 \
+  --eval_freq=-1 \
+  --save_checkpoint=false \
+  --policy.device=cuda \
+  --policy.push_to_hub=false
+```
+
+Train thật theo tài liệu hiện tại:
+
+```bash
+cd /home/jkl0909/code/Son/unitree_lerobot/unitree_lerobot/lerobot
+conda activate unitree_lerobot
+
+python -m lerobot.scripts.lerobot_train \
+  --policy.type=act_lite \
+  --dataset.repo_id=local/episode_20260629_172043_native_arm14_k1 \
+  --dataset.root=$HOME/.cache/huggingface/lerobot/local/episode_20260629_172043_native_arm14_k1 \
+  --batch_size=8 \
+  --steps=100000 \
+  --eval_freq=-1 \
+  --log_freq=200 \
+  --save_freq=20000 \
+  --policy.device=cuda \
+  --policy.push_to_hub=false
+```
+
+Checkpoint ACT-Lite local hiện có:
+
+```text
+checkpoints/act_lite_010000_pretrained_model/pretrained_model/
+```
+
+Config checkpoint:
+
+```text
+policy.type = act_lite
+state_dim = 14
+action_dim = 14
+camera_keys = observation.images.head
+chunk_size = 100
+n_action_steps = 100
+```
+
+### 14.5. Deploy/Test ACT-Lite Với Robot
+
+`hybrid_arm_infer.py` hiện đã hỗ trợ ACT-Lite. Nếu checkpoint là `act_lite`, output 14D được dùng trực tiếp làm target cho 14 khớp cánh tay.
+
+Ví dụ command skeleton:
+
+```bash
+cd /home/jkl0909/code/Son/unitree_lerobot
+conda activate unitree_lerobot
+
+python unitree_lerobot/eval_robot/hybrid_arm_infer.py \
+  --policy-path=/home/jkl0909/code/Son/unitree_lerobot/checkpoints/act_lite_010000_pretrained_model/pretrained_model \
+  --repo-id=local/episode_20260629_172043_native_arm14_k1 \
+  --root=$HOME/.cache/huggingface/lerobot/local/episode_20260629_172043_native_arm14_k1 \
+  --episode=0 \
+  --max-policy-steps=300 \
+  --actions-per-inference=100 \
+  --prefetch-threshold=0.9 \
+  --frequency=30 \
+  --network-interface=enp1s0 \
+  --motion \
+  --initialize-from-dataset \
+  --send-actions \
+  --control-confirmation=SEND_TO_REAL_G1
+```
+
+Khi chưa chắc chắn robot nhận lệnh an toàn, bỏ 2 flag này để dry-run:
+
+```text
+--send-actions
+--control-confirmation=SEND_TO_REAL_G1
+```
+
+### 14.6. Khác Biệt Quan Trọng Khi Deploy
+
+Với policy train từ `action[t] = state[t+1]`, policy rất nhạy với `observation.state`.
+
+Nếu offline test dùng:
+
+```text
+dataset video + dataset state -> policy -> dataset action
+```
+
+thì kết quả có thể tốt.
+
+Nhưng deploy thật mặc định dùng:
+
+```text
+dataset/real video + real robot state -> policy -> action
+```
+
+Nếu robot đang lệch trajectory train, policy có thể sinh action rất nhỏ hoặc gần trạng thái hiện tại. Vì vậy để kiểm chứng checkpoint, cần phân biệt rõ:
+
+```text
+1. replay dataset action: kiểm tra robot/trajectory
+2. offline policy test với dataset_state: kiểm tra policy có học dataset không
+3. hybrid policy với real_state: kiểm tra policy có robust ngoài trajectory không
+```
+
+Một episode đơn lẻ chưa đủ để policy robust khi robot lệch khỏi trajectory. Muốn deploy thật tốt cần record nhiều episode hơn, hoặc dùng command target thật thay vì chỉ lấy `state[t+1]`.
