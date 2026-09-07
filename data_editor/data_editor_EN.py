@@ -6,7 +6,7 @@ import shutil
 from collections import defaultdict
 
 from PyQt5.QtCore import Qt, QTimer, QRect, pyqtSignal
-from PyQt5.QtGui import QPixmap, QPainter, QColor, QPen, QBrush
+from PyQt5.QtGui import QPixmap, QPainter, QColor, QPen, QBrush, QTransform
 from PyQt5.QtWidgets import (
     QApplication,
     QWidget,
@@ -258,6 +258,13 @@ class DatasetPlayer(QWidget):
 
     CAM_LAYOUT = [0, 1, 2, 3]
     FILE_PATTERN = re.compile(r"^(\d+)_color_(\d+)\.jpg$", re.IGNORECASE)
+
+    # Camera ids drawn rotated 90 degrees counter-clockwise. The wrist cameras
+    # are mounted sideways, so their recordings come out on their side; this
+    # only turns them upright for viewing. The JPEG files on disk are never
+    # touched, so anything reading the dataset still sees the original frames.
+    # Set to an empty set to disable, or edit the ids to match your rig.
+    ROTATE_CCW_CAMS = {1, 2}
 
     def __init__(self, root_dir, interval_ms=100):
         super().__init__()
@@ -756,6 +763,10 @@ class DatasetPlayer(QWidget):
                 if pixmap.isNull():
                     label.set_placeholder(f"Camera {cam_id}\nFailed to read image")
                 else:
+                    if cam_id in self.ROTATE_CCW_CAMS:
+                        # Qt rotates clockwise for a positive angle, so -90 is CCW.
+                        pixmap = pixmap.transformed(QTransform().rotate(-90),
+                                                    Qt.SmoothTransformation)
                     label.set_pixmap(pixmap)
             else:
                 label.set_placeholder(f"Camera {cam_id}\nMissing frame")

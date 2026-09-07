@@ -268,6 +268,29 @@ G1_INSPIRE_CONFIG = RobotConfig(
 )
 
 
+# xr_teleoperate's --camera-layout=head setup: one monocular head camera plus
+# left/right wrist cameras (color_0/1/2) -- no binocular head pair like
+# G1_INSPIRE_CONFIG assumes (color_0..3 = left_high/right_high/left_wrist/
+# right_wrist). Reusing that mapping here would swap our wrist footage: color_1
+# (our left wrist) would be filed under "cam_right_high" and color_2 (our
+# right wrist) under "cam_left_wrist", with "cam_right_wrist" left empty.
+G1_INSPIRE_3CAM_CONFIG = RobotConfig(
+    motors=G1_INSPIRE_CONFIG.motors,
+    cameras=[
+        "cam_left_high",
+        "cam_left_wrist",
+        "cam_right_wrist",
+    ],
+    camera_to_image_key={
+        "color_0": "cam_left_high",
+        "color_1": "cam_left_wrist",
+        "color_2": "cam_right_wrist",
+    },
+    json_state_data_name=G1_INSPIRE_CONFIG.json_state_data_name,
+    json_action_data_name=G1_INSPIRE_CONFIG.json_action_data_name,
+)
+
+
 MOVEIBLE_LIFT_G1_DEX1_USEWAIST_CONFIG = RobotConfig(
     motors=[
         "kLeftShoulderPitch",
@@ -495,6 +518,7 @@ ROBOT_CONFIGS = {
     "Unitree_G1_Dex3": G1_DEX3_CONFIG,
     "Unitree_G1_Brainco": G1_BRAINCO_CONFIG,
     "Unitree_G1_Inspire": G1_INSPIRE_CONFIG,
+    "Unitree_G1_Inspire_3Cam": G1_INSPIRE_3CAM_CONFIG,
     "Unitree_G1_MoveibleLift_Dex1_UseWaist": MOVEIBLE_LIFT_G1_DEX1_USEWAIST_CONFIG,
     "Unitree_G1_MoveibleLift_Dex1_NoUseWaist": MOVEIBLE_LIFT_G1_DEX1_NOUSEWAIST_CONFIG,
     "Unitree_G1_Lift_Dex1_UseWaist": LIFT_G1_DEX1_USEWAIST_CONFIG,
