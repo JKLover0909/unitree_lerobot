@@ -120,6 +120,8 @@ class EvalRealConfig:
     root: str = ""
     episodes: int = 0
     frequency: float = 30.0
+    # torchcodec (LeRobot default) is incompatible with torch 2.3.0 (missing register_fake); use pyav.
+    video_backend: str = "pyav"
 
     # Basic control parameters
     arm: str = "G1_29"  # G1_29, G1_23
