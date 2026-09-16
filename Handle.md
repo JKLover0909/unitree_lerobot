@@ -64,33 +64,54 @@ Tài liệu này gói toàn bộ context của phiên làm việc (2026-09-15/16
 
 ## 6. Inference lên ROBOT THẬT (closed-loop) — ĐÃ CHUẨN BỊ, chưa chạy (cần phần cứng)
 
-- Script: `unitree_lerobot/eval_robot/eval_g1.py`. Nạp policy generic qua `--policy.path`; dùng
-  `--repo_id` để lấy normalization stats + tư thế khởi tạo; `--arm=G1_29 --ee=inspire1` (inspire1 = 6-dof,
-  khớp data). **`--send_real_robot` mặc định false** (chỉ chạy policy, không gửi lệnh ra robot) — nhưng
-  file vẫn gọi `setup_image_client` + `setup_robot_interface` ngay khi khởi động, nên **bắt buộc có
-  image_server + kết nối robot DDS/eno1 + driver tay** mới chạy được, kể cả khi false.
-- Lệnh mẫu (env `tv`):
+- Script: `unitree_lerobot/eval_robot/eval_g1.py` — nạp policy generic qua `--policy.path`, dùng
+  `--repo_id` để lấy normalization stats + tư thế khởi tạo. **Nhưng đừng gọi thẳng file này**, xem 2 gạch
+  đầu dòng dưới: chạy qua `eval_g1_eno1.py` với `--ee=inspire_ftp`.
+- **Tay: đã xác minh và ĐÃ VÁ (2026-09-16).** `--ee=inspire1` KHÔNG điều khiển được tay trên con này:
+  `Inspire_Controller` publish `rt/inspire/cmd` (`MotorCmds_`, tay DFX), còn phần cứng ở đây nghe
+  `rt/inspire_hand/ctrl/l|r` (`inspire_dds.inspire_hand_ctrl`, tay FTP) — cánh tay chạy theo policy còn
+  tay đứng im, **không báo lỗi bên nào**. Đã thêm `Inspire_FTP_Controller`
+  (`eval_robot/robot_control/robot_hand_inspire.py`) + `EE_CONFIG["inspire_ftp"]`
+  (`eval_robot/make_robot.py`). → **Dùng `--ee=inspire_ftp`**, không phải `inspire1`.
+- **Thêm `eval_robot/eval_g1_eno1.py`** (bản sao pattern của `replay_robot_eno1.py`): ghim DDS vào `eno1`
+  trước khi import `eval_g1` (máy nhiều NIC, CycloneDDS tự dò hay chọn nhầm và **fail im lặng**) và nhả
+  onboard AI/Sport mode (nếu không, controller onboard tranh motor với policy → rung/giật). **Chạy file
+  này thay cho `eval_g1.py` trực tiếp.**
+- **Tiền đề: FTP bridge phải chạy cho CẢ HAI tay** trước khi eval, nếu không lệnh đi vào hư không và
+  state array đứng ở 0:
   ```
-  PYTHONNOUSERSITE=1 conda run -n tv python unitree_lerobot/eval_robot/eval_g1.py \
+  python unitree_lerobot/eval_robot/inspire_hand_ftp_driver.py --network-interface=eno1 \
+    --hand=left  --ip=192.168.123.210 --frequency=20 --no-touch
+  python unitree_lerobot/eval_robot/inspire_hand_ftp_driver.py --network-interface=eno1 \
+    --hand=right --ip=192.168.123.211 --frequency=20 --no-touch
+  ```
+- Lệnh eval (env `tv`), sau khi đã bật robot + image_server + 2 bridge:
+  ```
+  PYTHONNOUSERSITE=1 conda run -n tv python unitree_lerobot/eval_robot/eval_g1_eno1.py \
     --policy.path=/home/jkl/Code/Fine-tune_pick_bottle_UnitreeG1/outputs/act_pick_bottle/checkpoints/050000/pretrained_model \
     --repo_id=local/pick_place_bottle --root="" --frequency=30 \
-    --arm=G1_29 --ee=inspire1 --visualization=true --send_real_robot=false
+    --arm=G1_29 --ee=inspire_ftp --visualization=true --send_real_robot=false
   ```
   Khi an toàn (có trực e-stop) mới đặt `--send_real_robot=true`.
-- **Điểm dễ vướng nhất:** tay được teleop qua driver **Inspire FTP (Modbus TCP)**
-  (`eval_robot/inspire_hand_ftp_driver.py`), còn `eval_g1.py --ee=inspire1` dùng `Inspire_Controller`
-  (DDS). Số chiều khớp (6-dof) nên policy chạy đúng, nhưng cần kiểm tra `Inspire_Controller` có điều khiển
-  đúng con tay FTP này không, hoặc cần chạy driver FTP song song như lúc teleop.
+- **`--send_real_robot` mặc định false** (chỉ chạy policy, không gửi lệnh ra robot) — nhưng file vẫn gọi
+  `setup_image_client` + `setup_robot_interface` ngay khi khởi động, nên **bắt buộc có image_server +
+  kết nối robot DDS/eno1 + bridge tay** mới chạy được, kể cả khi false.
+- **Chưa chạy được lần nào:** tại thời điểm bàn giao, `192.168.123.164/210/211/161` đều không ping được
+  (robot tắt/chưa cắm). Phần code đã sẵn sàng, chỉ còn chờ phần cứng.
 
 ## 7. Việc CÒN LẠI
 
 1. **HuggingFace**: máy chưa auth. Đăng nhập rồi mới push được checkpoint/dataset để có link:
    `PYTHONNOUSERSITE=1 conda run -n tv hf auth login --token hf_xxx` (token quyền Write). Sau đó push
    checkpoint (592M) và/hoặc dataset (969M) lên repo private.
-2. **Eval trên robot thật** (mục 6): bật image_server + robot, chạy visualize trước, rồi mới `send_real`.
-3. **Push fork `unitree_lerobot`**: 2 commit fix đang ở **local, CHƯA push** — `631c822` (offline_infer
-   thêm --video-backend), `87bd38a` (eval_g1/eval_g1_dataset/eval_g1_sim thêm cfg.video_backend, mặc định
-   pyav). Branch `hungvd`.
+2. **Eval trên robot thật** (mục 6): bật robot + image_server + 2 FTP bridge, chạy `eval_g1_eno1.py`
+   với `--ee=inspire_ftp --visualization=true --send_real_robot=false` trước, rồi mới `send_real=true`.
+3. ~~Push fork `unitree_lerobot`~~ — **XONG (2026-09-16)**: branch `hungvd` đã sync với
+   `origin/hungvd`, gồm 631c822, 87bd38a, b125b5a, 56af93a.
+4. **Dataset teleop dở dang `pick_bottle_0916_3`**: 11 ep trong
+   `xr_teleoperate/teleop/utils/data/pick_bottle_0916_3/`, ghi lúc 15:43-15:47 ngày 2026-09-16 rồi dừng
+   (robot mất kết nối). Phiên teleop bị kill để giải phóng phần cứng, nên ep cuối có thể dở. **Chưa
+   kiểm tra, chưa convert, chưa nằm trong tập train 63 ep.** Muốn dùng thì lọc ep hỏng rồi convert thêm.
 
 ## 8. Bẫy môi trường đã gặp (đã xử — nhớ để khỏi vấp lại)
 
@@ -108,4 +129,5 @@ Tài liệu này gói toàn bộ context của phiên làm việc (2026-09-15/16
 ## 9. Commit đã tạo trong phiên này
 
 - `Fine-tune_pick_bottle_UnitreeG1` (đã push `main`): ae84b7e, f8e7b6b, 3ff0bcc, ef9fead, 478bd47.
-- `unitree_lerobot` (branch `hungvd`, **chưa push**): 631c822, 87bd38a.
+- `unitree_lerobot` (branch `hungvd`, **đã push**): 631c822, 87bd38a, b125b5a (Handle.md),
+  56af93a (inspire_ftp EE path + eval_g1_eno1.py).
