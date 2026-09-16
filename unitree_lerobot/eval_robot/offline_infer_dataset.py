@@ -86,6 +86,14 @@ def parse_args() -> argparse.Namespace:
             "frame and compares only the first predicted action."
         ),
     )
+    parser.add_argument(
+        "--video-backend",
+        default="pyav",
+        help=(
+            "Video decode backend for LeRobotDataset. Default 'pyav' because 'torchcodec' is incompatible "
+            "with torch 2.3.0 (missing torch.library.register_fake)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -387,7 +395,7 @@ def main() -> None:
     policy_path = Path(args.policy_path)
     run_dir = make_run_dir(output_root, args.run_name, args.episode, args.mode)
 
-    dataset = LeRobotDataset(repo_id=args.repo_id, root=args.root)
+    dataset = LeRobotDataset(repo_id=args.repo_id, root=args.root, video_backend=args.video_backend)
     policy_cfg, policy, preprocessor, postprocessor, device = load_policy_and_processors(policy_path, dataset)
 
     config = {
