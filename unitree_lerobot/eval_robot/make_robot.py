@@ -18,7 +18,10 @@ from unitree_lerobot.eval_robot.robot_control.robot_hand_unitree import (
 
 from unitree_lerobot.eval_robot.utils.episode_writer import EpisodeWriter
 
-from unitree_lerobot.eval_robot.robot_control.robot_hand_inspire import Inspire_Controller
+from unitree_lerobot.eval_robot.robot_control.robot_hand_inspire import (
+    Inspire_Controller,
+    Inspire_FTP_Controller,
+)
 from unitree_lerobot.eval_robot.robot_control.robot_hand_brainco import Brainco_Controller
 from unitree_lerobot.eval_robot.robot_control.mobile_control import G1_Mobile_Lift_Controller
 
@@ -55,6 +58,15 @@ EE_CONFIG: dict[str, dict[str, Any]] = {
     },
     "inspire1": {
         "controller": Inspire_Controller,
+        "dof": 6,
+        "shared_mem_type": "Array",
+        "shared_mem_size": 6,
+        # "out_len": 12,
+    },
+    # FTP hands: same 6-dof layout, different DDS topics (rt/inspire_hand/ctrl/l|r).
+    # This is the one that matches hardware teleoped with --ee=inspire_ftp.
+    "inspire_ftp": {
+        "controller": Inspire_FTP_Controller,
         "dof": 6,
         "shared_mem_type": "Array",
         "shared_mem_size": 6,
