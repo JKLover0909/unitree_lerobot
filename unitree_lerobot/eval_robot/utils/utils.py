@@ -126,6 +126,11 @@ class EvalRealConfig:
     # Basic control parameters
     arm: str = "G1_29"  # G1_29, G1_23
     ee: str = "dex3"  # dex3, dex1, inspire1, inspire_ftp, brainco
+    # PC2 camera server IP (ethernet NIC), same value as teleop_hand_and_arm.py's --img-server-ip. This
+    # field did not exist before -- make_robot.py's setup_image_client() read it via getattr with a
+    # "127.0.0.1" fallback, so every run silently connected to localhost and failed with "Failed to get
+    # camera configuration" regardless of any CLI flag (see Checklist.md). Now --image_host actually works.
+    image_host: str = "192.168.123.164"
 
     # Mode flags
     motion: bool = False

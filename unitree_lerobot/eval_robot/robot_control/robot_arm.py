@@ -238,17 +238,46 @@ class G1_29_ArmController:
             self.q_target = np.zeros(14)
             # self.tauff_target = np.zeros(14)
         tolerance = 0.05  # Tolerance threshold for joint angles to determine "close to zero", can be adjusted based on your motor's precision requirements
+        reached_home = False
         while current_attempts < max_attempts:
             current_q = self.get_current_dual_arm_q()
             if np.all(np.abs(current_q) < tolerance):
-                if self.motion_mode:
-                    for weight in np.linspace(1, 0, num=101):
-                        self.msg.motor_cmd[G1_29_JointIndex.kNotUsedJoint0].q = weight
-                        time.sleep(0.02)
+                reached_home = True
                 logger_mp.info("[G1_29_ArmController] both arms have reached the home position.")
                 break
             current_attempts += 1
             time.sleep(0.05)
+        if not reached_home:
+            logger_mp.warning(
+                f"[G1_29_ArmController] arms did not reach the home position within "
+                f"{max_attempts * 0.05:.1f}s; releasing arm_sdk anyway."
+            )
+        # The arm_sdk takeover weight has to come down on EVERY exit path, not only
+        # when the arms happen to settle within tolerance (which is where this ramp
+        # used to live). Leaving motor_cmd[kNotUsedJoint0].q at 1.0 keeps arm_sdk
+        # latched onto both arms, so the onboard controller never gets them back and
+        # the robot stays stuck in that half-state until it is power-cycled.
+        self.release_arm_sdk_weight()
+
+    def release_arm_sdk_weight(self):
+        """Ramp the arm_sdk takeover weight (motor_cmd[kNotUsedJoint0].q) from 1 back
+        to 0, handing both arms back to the onboard controller. No-op when
+        motion_mode is False -- that path publishes raw rt/lowcmd and has no weight
+        joint. Safe to call more than once."""
+        if not self.motion_mode:
+            return
+        logger_mp.info("[G1_29_ArmController] releasing arm_sdk weight 1 -> 0...")
+        try:
+            for weight in np.linspace(1, 0, num=101):
+                self.msg.motor_cmd[G1_29_JointIndex.kNotUsedJoint0].q = weight
+                time.sleep(0.02)
+        finally:
+            # A second Ctrl+C can cut the ramp short; never leave the weight part-way.
+            self.msg.motor_cmd[G1_29_JointIndex.kNotUsedJoint0].q = 0.0
+            # Let the 250 Hz publisher thread put the final weight=0 on the wire
+            # before the caller tears the process down.
+            time.sleep(0.05)
+        logger_mp.info("[G1_29_ArmController] arm_sdk weight released; arms handed back.")
 
     def speed_gradual_max(self, t=5.0):
         """Parameter t is the total time required for arms velocity to gradually increase to its maximum value, in seconds. The default is 5.0."""
@@ -529,17 +558,46 @@ class G1_23_ArmController:
             self.q_target = np.zeros(10)
             # self.tauff_target = np.zeros(10)
         tolerance = 0.05  # Tolerance threshold for joint angles to determine "close to zero", can be adjusted based on your motor's precision requirements
+        reached_home = False
         while current_attempts < max_attempts:
             current_q = self.get_current_dual_arm_q()
             if np.all(np.abs(current_q) < tolerance):
-                if self.motion_mode:
-                    for weight in np.linspace(1, 0, num=101):
-                        self.msg.motor_cmd[G1_23_JointIndex.kNotUsedJoint0].q = weight
-                        time.sleep(0.02)
+                reached_home = True
                 logger_mp.info("[G1_23_ArmController] both arms have reached the home position.")
                 break
             current_attempts += 1
             time.sleep(0.05)
+        if not reached_home:
+            logger_mp.warning(
+                f"[G1_23_ArmController] arms did not reach the home position within "
+                f"{max_attempts * 0.05:.1f}s; releasing arm_sdk anyway."
+            )
+        # The arm_sdk takeover weight has to come down on EVERY exit path, not only
+        # when the arms happen to settle within tolerance (which is where this ramp
+        # used to live). Leaving motor_cmd[kNotUsedJoint0].q at 1.0 keeps arm_sdk
+        # latched onto both arms, so the onboard controller never gets them back and
+        # the robot stays stuck in that half-state until it is power-cycled.
+        self.release_arm_sdk_weight()
+
+    def release_arm_sdk_weight(self):
+        """Ramp the arm_sdk takeover weight (motor_cmd[kNotUsedJoint0].q) from 1 back
+        to 0, handing both arms back to the onboard controller. No-op when
+        motion_mode is False -- that path publishes raw rt/lowcmd and has no weight
+        joint. Safe to call more than once."""
+        if not self.motion_mode:
+            return
+        logger_mp.info("[G1_23_ArmController] releasing arm_sdk weight 1 -> 0...")
+        try:
+            for weight in np.linspace(1, 0, num=101):
+                self.msg.motor_cmd[G1_23_JointIndex.kNotUsedJoint0].q = weight
+                time.sleep(0.02)
+        finally:
+            # A second Ctrl+C can cut the ramp short; never leave the weight part-way.
+            self.msg.motor_cmd[G1_23_JointIndex.kNotUsedJoint0].q = 0.0
+            # Let the 250 Hz publisher thread put the final weight=0 on the wire
+            # before the caller tears the process down.
+            time.sleep(0.05)
+        logger_mp.info("[G1_23_ArmController] arm_sdk weight released; arms handed back.")
 
     def speed_gradual_max(self, t=5.0):
         """Parameter t is the total time required for arms velocity to gradually increase to its maximum value, in seconds. The default is 5.0."""

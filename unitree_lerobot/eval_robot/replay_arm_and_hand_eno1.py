@@ -148,95 +148,106 @@ def main():
     init_action = actions[from_idx]["action"].numpy()
     final_action = actions[to_idx]["action"].numpy()
 
-    user_input = input("Please enter the start signal (enter 's' to start the subsequent program): ")
-    if user_input.lower() != "s":
-        logger_mp.info("Huy.")
-        return
+    try:
+        user_input = input("Please enter the start signal (enter 's' to start the subsequent program): ")
+        if user_input.lower() != "s":
+            logger_mp.info("Huy.")
+            return
 
-    logger_mp.info("Initializing robot to starting pose...")
-    move_to_pose_and_wait(init_action[ARM], "starting pose", hand_action_np=init_action)
-
-    confirm = input("Robot is at the episode's starting pose. Enter 's' to start playback: ")
-    if confirm.lower() != "s":
-        logger_mp.info("Playback cancelled.")
-        return
-
-    # 'q' (any time from here on) requests stopping the program for good.
-    # 's' (only listened to while idle between episodes, see the outer loop
-    # below) requests another playback of the same episode. Ctrl+C is
-    # equivalent to 'q' wherever it's caught below. Either way, the robot
-    # finishes moving to the episode's actual final recorded pose instead of
-    # freezing wherever it happened to be interrupted.
-    stop_requested = threading.Event()
-    replay_requested = threading.Event()
-
-    def on_press(key):
-        if key == "q" and not stop_requested.is_set():
-            logger_mp.info("'q' received -- stopping and moving to the episode's final pose.")
-            stop_requested.set()
-        elif key == "s":
-            replay_requested.set()
-
-    listener_thread = threading.Thread(
-        target=listen_keyboard,
-        kwargs={"on_press": on_press, "until": None, "sequential": False},
-        daemon=True,
-    )
-    listener_thread.start()
-
-    # Logging every frame floods the terminal at 30 Hz; throttle to ~1 line
-    # every 3 seconds of playback instead, scaled to whatever --frequency is.
-    log_every_n_frames = max(1, round(3.0 * args.frequency))
-
-    def play_episode_once():
-        """Move to the episode's start pose (a no-op if already there, e.g.
-        right after the confirmation step below), play through it or stop
-        early on 'q'/Ctrl+C, then settle at its final pose."""
+        logger_mp.info("Initializing robot to starting pose...")
         move_to_pose_and_wait(init_action[ARM], "starting pose", hand_action_np=init_action)
+
+        confirm = input("Robot is at the episode's starting pose. Enter 's' to start playback: ")
+        if confirm.lower() != "s":
+            logger_mp.info("Playback cancelled.")
+            return
+
+        # 'q' (any time from here on) requests stopping the program for good.
+        # 's' (only listened to while idle between episodes, see the outer loop
+        # below) requests another playback of the same episode. Ctrl+C is
+        # equivalent to 'q' wherever it's caught below. Either way, the robot
+        # finishes moving to the episode's actual final recorded pose instead of
+        # freezing wherever it happened to be interrupted.
+        stop_requested = threading.Event()
+        replay_requested = threading.Event()
+
+        def on_press(key):
+            if key == "q" and not stop_requested.is_set():
+                logger_mp.info("'q' received -- stopping and moving to the episode's final pose.")
+                stop_requested.set()
+            elif key == "s":
+                replay_requested.set()
+
+        listener_thread = threading.Thread(
+            target=listen_keyboard,
+            kwargs={"on_press": on_press, "until": None, "sequential": False},
+            daemon=True,
+        )
+        listener_thread.start()
+
+        # Logging every frame floods the terminal at 30 Hz; throttle to ~1 line
+        # every 3 seconds of playback instead, scaled to whatever --frequency is.
+        log_every_n_frames = max(1, round(3.0 * args.frequency))
+
+        def play_episode_once():
+            """Move to the episode's start pose (a no-op if already there, e.g.
+            right after the confirmation step below), play through it or stop
+            early on 'q'/Ctrl+C, then settle at its final pose."""
+            move_to_pose_and_wait(init_action[ARM], "starting pose", hand_action_np=init_action)
+            try:
+                for i, global_idx in enumerate(range(from_idx, to_idx + 1)):
+                    if stop_requested.is_set():
+                        logger_mp.info(f"Stopping early at frame {i}/{num_episode_frames}.")
+                        break
+                    loop_start = time.perf_counter()
+                    action_np = actions[global_idx]["action"].numpy()
+
+                    arm_action = action_np[ARM]
+                    tau = arm_ik.solve_tau(arm_action)
+                    arm_ctrl.ctrl_dual_arm(arm_action, tau)
+
+                    log_this_frame = i % log_every_n_frames == 0
+                    label = f"frame {i}/{num_episode_frames}" if log_this_frame else None
+                    send_hand(action_np, label)
+                    if log_this_frame:
+                        logger_mp.info(f"frame {i}/{num_episode_frames}  arm_action {arm_action}, tau {tau}")
+
+                    time.sleep(max(0, (1.0 / args.frequency) - (time.perf_counter() - loop_start)))
+                else:
+                    logger_mp.info("Reached the end of the episode.")
+            except KeyboardInterrupt:
+                logger_mp.info("Ctrl+C received -- stopping and moving to the episode's final pose.")
+                stop_requested.set()
+
+            logger_mp.info("Moving to the episode's final recorded pose...")
+            move_to_pose_and_wait(final_action[ARM], "episode's final pose", hand_action_np=final_action)
+
+        while True:
+            play_episode_once()
+            if stop_requested.is_set():
+                break
+
+            logger_mp.info("Episode finished. Press 's' to play it again, or 'q'/Ctrl+C to stop.")
+            replay_requested.clear()  # ignore any stray 's' presses that landed during playback
+            try:
+                while not stop_requested.is_set() and not replay_requested.is_set():
+                    time.sleep(0.1)
+            except KeyboardInterrupt:
+                logger_mp.info("Ctrl+C received -- stopping.")
+                break
+            if stop_requested.is_set():
+                break
+            # replay_requested is set -> loop back and play the episode again
+    finally:
+        # Hand both arms back to the onboard controller before exiting. With
+        # --motion the arm controller holds arm_sdk's takeover weight
+        # (motor_cmd[kNotUsedJoint0].q) at 1.0 for the whole run; without this
+        # step it stays at 1.0 after the process dies, arm_sdk keeps the arms
+        # latched, and the robot never regains them -- see Checklist.md.
         try:
-            for i, global_idx in enumerate(range(from_idx, to_idx + 1)):
-                if stop_requested.is_set():
-                    logger_mp.info(f"Stopping early at frame {i}/{num_episode_frames}.")
-                    break
-                loop_start = time.perf_counter()
-                action_np = actions[global_idx]["action"].numpy()
-
-                arm_action = action_np[ARM]
-                tau = arm_ik.solve_tau(arm_action)
-                arm_ctrl.ctrl_dual_arm(arm_action, tau)
-
-                log_this_frame = i % log_every_n_frames == 0
-                label = f"frame {i}/{num_episode_frames}" if log_this_frame else None
-                send_hand(action_np, label)
-                if log_this_frame:
-                    logger_mp.info(f"frame {i}/{num_episode_frames}  arm_action {arm_action}, tau {tau}")
-
-                time.sleep(max(0, (1.0 / args.frequency) - (time.perf_counter() - loop_start)))
-            else:
-                logger_mp.info("Reached the end of the episode.")
-        except KeyboardInterrupt:
-            logger_mp.info("Ctrl+C received -- stopping and moving to the episode's final pose.")
-            stop_requested.set()
-
-        logger_mp.info("Moving to the episode's final recorded pose...")
-        move_to_pose_and_wait(final_action[ARM], "episode's final pose", hand_action_np=final_action)
-
-    while True:
-        play_episode_once()
-        if stop_requested.is_set():
-            break
-
-        logger_mp.info("Episode finished. Press 's' to play it again, or 'q'/Ctrl+C to stop.")
-        replay_requested.clear()  # ignore any stray 's' presses that landed during playback
-        try:
-            while not stop_requested.is_set() and not replay_requested.is_set():
-                time.sleep(0.1)
-        except KeyboardInterrupt:
-            logger_mp.info("Ctrl+C received -- stopping.")
-            break
-        if stop_requested.is_set():
-            break
-        # replay_requested is set -> loop back and play the episode again
+            arm_ctrl.ctrl_dual_arm_go_home()
+        except Exception as e:
+            logger_mp.error(f"Failed to bring the arms home: {e}")
 
 
 if __name__ == "__main__":

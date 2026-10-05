@@ -86,7 +86,9 @@ def setup_image_client(args: argparse.Namespace) -> dict[str, Any]:
     """Initializes and starts the image client and shared memory."""
     # image client: img_config should be the same as the configuration in image_server.py (of Robot's development computing unit)
     
-    image_client = ImageClient(host=getattr(args, "image_host", "127.0.0.1"), request_bgr=True)
+    # Fallback matches ImageClient's own default (PC2 ethernet IP), not localhost -- see Checklist.md
+    # for why a "127.0.0.1" fallback here silently broke every caller that lacked an image_host field.
+    image_client = ImageClient(host=getattr(args, "image_host", "192.168.123.164"), request_bgr=True)
     image_config = image_client.get_cam_config()
     return image_client, image_config
 
@@ -198,8 +200,15 @@ def process_images_and_observations(img_client, camera_config, arm_ctrl):
         if camera_config['head_camera']['enable_zmq']:
             head_img = img_client.get_head_frame()
             if head_img is not None:
-                observation["observation.images.cam_left_high"] = to_tensor_rgb(head_img.bgr[:, :camera_config['head_camera']['image_shape'][1]//2])
-                observation["observation.images.cam_right_high"] = to_tensor_rgb(head_img.bgr[:, camera_config['head_camera']['image_shape'][1]//2:])
+                if camera_config['head_camera'].get('binocular', False):
+                    half_w = camera_config['head_camera']['image_shape'][1] // 2
+                    observation["observation.images.cam_left_high"] = to_tensor_rgb(head_img.bgr[:, :half_w])
+                    observation["observation.images.cam_right_high"] = to_tensor_rgb(head_img.bgr[:, half_w:])
+                else:
+                    # Mono head camera (this rig: RealSense, image_shape [480, 640], binocular=false).
+                    # Splitting in half unconditionally here used to feed the policy a wrong 480x320
+                    # crop instead of the full 480x640 frame it was trained on -- see Checklist.md.
+                    observation["observation.images.cam_left_high"] = to_tensor_rgb(head_img.bgr)
             else:
                 logger_mp.warning("Head image is None!")
 

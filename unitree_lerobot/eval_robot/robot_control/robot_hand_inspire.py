@@ -234,26 +234,67 @@ class Inspire_FTP_Controller:
         self.left_hand_state_array = Array("d", Inspire_Num_Motors, lock=True)
         self.right_hand_state_array = Array("d", Inspire_Num_Motors, lock=True)
 
+        # Explicit "a real state message has arrived" flags. Do NOT infer this from
+        # any(state_array): a hand legitimately closed to angle 0 on all six joints
+        # reads as all-zeros, which is indistinguishable from "no data yet".
+        self.left_state_seen = threading.Event()
+        self.right_state_seen = threading.Event()
+
         self.subscribe_state_thread = threading.Thread(target=self._subscribe_hand_state)
         self.subscribe_state_thread.daemon = True
         self.subscribe_state_thread.start()
 
-        # Bounded wait: a missing FTP bridge should warn, not hang the eval run.
+        # Wait for BOTH hands, not either. This condition used to be `or` (and tested
+        # any(state_array) rather than an arrival flag), so it returned as soon as the
+        # FIRST hand reported -- measured at 0.04s on this rig -- while the other hand's
+        # state array was still all zeros. The seed below then copied those zeros into
+        # that hand's target and control_process() drove the REAL hand to angle 0 at
+        # ~100Hz, regardless of --send_real_robot. Measured 2026-09-20 during a
+        # --send_real_robot=false dry run: the right hand went [2,1,1,4,244,149] ->
+        # [2,0,1,2,2,0] with motor current up to 744 for ~28s, while the left hand
+        # (seeded correctly) never moved. See Checklist.md.
         wait_count = 0
-        while not (any(self.left_hand_state_array) or any(self.right_hand_state_array)):
+        deadline = time.time() + 5.0
+        while not (self.left_state_seen.is_set() and self.right_state_seen.is_set()):
             if wait_count % 100 == 0:
                 logger_mp.info("[Inspire_FTP_Controller] Waiting to subscribe dds...")
+            if time.time() > deadline:
+                missing = [
+                    name for name, ev in (("left", self.left_state_seen), ("right", self.right_state_seen))
+                    if not ev.is_set()
+                ]
+                # Deliberately fatal, not a warning. Proceeding would start
+                # control_process() with an all-zero target for the unseeded hand,
+                # which is real actuation on real hardware. A silently frozen state
+                # branch on the FTP bridge (a known failure mode of this rig) looks
+                # exactly like this, so refuse rather than move the hand.
+                raise RuntimeError(
+                    f"[Inspire_FTP_Controller] No hand state received for: {', '.join(missing)} "
+                    f"(topics {kTopicInspireFTPLeftState} / {kTopicInspireFTPRightState}) within 5s. "
+                    "Refusing to start -- the actuation process would drive the unseeded hand to "
+                    "angle 0. Check that inspire_hand_ftp_driver.py is running for BOTH hands and "
+                    "that its state branch has not silently frozen (count distinct angle_act values)."
+                )
             time.sleep(0.01)
             wait_count += 1
-            if wait_count > 500:
-                logger_mp.warning(
-                    "[Inspire_FTP_Controller] Timeout waiting for hand state on "
-                    f"{kTopicInspireFTPLeftState} / {kTopicInspireFTPRightState}. "
-                    "Is inspire_hand_ftp_driver.py running for both hands? Proceeding anyway."
-                )
-                break
-        else:
-            logger_mp.info("[Inspire_FTP_Controller] Subscribe dds ok.")
+        logger_mp.info("[Inspire_FTP_Controller] Subscribe dds ok (both hands reporting).")
+
+        # Seed the shared "target" arrays (left_hand_array/right_hand_array, i.e.
+        # ee_shared_mem["left"/"right"]) with the hand's own current reported position
+        # instead of leaving them at their zero default. control_process() below reads
+        # its actuation target straight from these arrays every cycle regardless of
+        # --send_real_robot -- a caller that legitimately never writes to them (e.g.
+        # eval_g1.py's dry run, which intentionally skips writing real policy actions
+        # when send_real_robot=False) was therefore driving the real hand toward
+        # angle=0 on every one of these ~100Hz cycles. Verified empirically
+        # 2026-09-20: this pulled a real hand from ~[999,997,1000,999,1000,990] to
+        # ~[1,0,3,3,340,0] with real motor current, entirely independent of
+        # --send_real_robot -- see Checklist.md. Seeding here makes an unwritten
+        # target a true no-op (hold current position) instead of a snap to zero.
+        with left_hand_array.get_lock():
+            left_hand_array[:] = self.left_hand_state_array[:]
+        with right_hand_array.get_lock():
+            right_hand_array[:] = self.right_hand_state_array[:]
 
         hand_control_process = Process(
             target=self.control_process,
@@ -279,11 +320,13 @@ class Inspire_FTP_Controller:
                 with self.left_hand_state_array.get_lock():
                     for i in range(Inspire_Num_Motors):
                         self.left_hand_state_array[i] = left_state_msg.angle_act[i] / 1000.0
+                self.left_state_seen.set()
             right_state_msg = self.RightHandState_subscriber.Read()
             if right_state_msg is not None and len(right_state_msg.angle_act) == Inspire_Num_Motors:
                 with self.right_hand_state_array.get_lock():
                     for i in range(Inspire_Num_Motors):
                         self.right_hand_state_array[i] = right_state_msg.angle_act[i] / 1000.0
+                self.right_state_seen.set()
             time.sleep(0.002)
 
     def ctrl_dual_hand(self, left_q_target, right_q_target):
